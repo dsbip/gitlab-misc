@@ -14,7 +14,7 @@
 #   GCP_PROJECTS -> (optional) comma-separated project IDs to scan.
 #                   Defaults to the service account's own project.
 #   COMPOSER_LOCATIONS -> (optional) comma-separated regions, e.g.
-#                   "us-central1,europe-west1". Defaults to all compute regions.
+#                   "europe-west2,europe-west1". Defaults to europe-west2.
 #
 # Download the CSV from the job page (Job artifacts > Download) or the API.
 

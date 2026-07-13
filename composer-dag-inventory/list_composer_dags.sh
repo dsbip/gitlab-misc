@@ -4,14 +4,14 @@
 # only gcloud / gcloud storage / jq — no Python REST client.
 #
 # For every RUNNING Composer environment it emits one CSV row per DAG:
-#   Composer, Project, DAG_Name, Dag_path, Active?, Scheduled, Scheduled Time, Email Alert
+#   Composer, Project, DAG_Name, Dag_path, Active?, Scheduled, Scheduled Time
 #
 # Data sources:
 #   * DAG_Name / Dag_path / Active?  -> `airflow dags list -o json`, invoked via
 #     `gcloud composer environments run` (Composer 2, no kubectl required).
-#   * Scheduled / Scheduled Time / Email Alert -> parsed from the DAG *source*,
-#     downloaded once per environment from its GCS dags bucket. These are
-#     best-effort heuristics; where the source can't be read they read "Unknown".
+#   * Scheduled / Scheduled Time -> parsed from the DAG *source*, downloaded once
+#     per environment from its GCS dags bucket. Best-effort heuristics; where the
+#     source can't be read they read "Unknown".
 #
 # Auth: relies on the active gcloud account (in CI: a service-account key
 # activated via `gcloud auth activate-service-account`). The identity needs
@@ -19,14 +19,17 @@
 #   - roles/composer.environmentAndStorageObjectViewer      (read DAG source)
 #
 # Config (flags override env vars):
-#   --projects   / GCP_PROJECTS         Comma-separated project IDs. Default: active gcloud project.
-#   --locations  / COMPOSER_LOCATIONS   Comma-separated regions. Default: all compute regions.
-#   --output     / OUTPUT_CSV           Output path. Default: composer_dags.csv
+#   <project> (positional) / GCP_PROJECTS   Project id(s) to scan. Default: active gcloud project.
+#   --locations / COMPOSER_LOCATIONS        Comma-separated regions. Default: europe-west2.
+#   --output    / OUTPUT_CSV                 Output path. Default: composer_dags.csv
 #
 # Usage:
-#   ./list_composer_dags.sh --projects my-proj --locations us-central1 --output out.csv
+#   ./list_composer_dags.sh my-project-id
+#   ./list_composer_dags.sh --projects proj-a,proj-b --locations europe-west2 --output out.csv
 
 set -uo pipefail
+
+DEFAULT_LOCATION="europe-west2"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -43,12 +46,12 @@ csv_escape() {
   printf '"%s"' "$s"
 }
 
-# Emit one CSV row (8 columns) with proper escaping.
+# Emit one CSV row (7 columns) with proper escaping.
 write_row() {
-  printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
+  printf '%s,%s,%s,%s,%s,%s,%s\n' \
     "$(csv_escape "${1-}")" "$(csv_escape "${2-}")" "$(csv_escape "${3-}")" \
     "$(csv_escape "${4-}")" "$(csv_escape "${5-}")" "$(csv_escape "${6-}")" \
-    "$(csv_escape "${7-}")" "$(csv_escape "${8-}")" >>"$OUTPUT_CSV"
+    "$(csv_escape "${7-}")" >>"$OUTPUT_CSV"
 }
 
 # ---------------------------------------------------------------------------
@@ -67,7 +70,15 @@ while [[ $# -gt 0 ]]; do
     -h|--help)
       grep '^#' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
-    *) die "Unknown argument: $1" ;;
+    -*) die "Unknown option: $1" ;;
+    *)
+      # First bare argument is the project id.
+      if [[ -z "$PROJECTS_ARG" ]]; then
+        PROJECTS_ARG="$1"; shift
+      else
+        die "Unexpected argument: $1"
+      fi
+      ;;
   esac
 done
 
@@ -81,7 +92,7 @@ if gcloud storage --help >/dev/null 2>&1; then
 elif command -v gsutil >/dev/null 2>&1; then
   STORAGE_CP="gsutil -m cp"
 else
-  log "WARN: neither 'gcloud storage' nor 'gsutil' available; Scheduled/Email columns will be Unknown."
+  log "WARN: neither 'gcloud storage' nor 'gsutil' available; Scheduled columns will be Unknown."
 fi
 
 # ---------------------------------------------------------------------------
@@ -108,43 +119,11 @@ resolve_locations() {
     printf '%s\n' "$raw" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$'
     return
   fi
-  local regions
-  regions="$(gcloud compute regions list --format='value(name)' 2>/dev/null)"
-  if [[ -n "$regions" ]]; then
-    printf '%s\n' "$regions"
-    return
-  fi
-  log "WARN: could not list compute regions; using a static fallback list."
-  cat <<'EOF'
-us-central1
-us-east1
-us-east4
-us-west1
-us-west2
-us-west3
-us-west4
-northamerica-northeast1
-southamerica-east1
-europe-west1
-europe-west2
-europe-west3
-europe-west4
-europe-west6
-europe-north1
-asia-east1
-asia-east2
-asia-northeast1
-asia-northeast2
-asia-northeast3
-asia-south1
-asia-southeast1
-asia-southeast2
-australia-southeast1
-EOF
+  printf '%s\n' "$DEFAULT_LOCATION"
 }
 
 # ---------------------------------------------------------------------------
-# Source-parsing heuristics (schedule + email) for one local DAG file
+# Source-parsing heuristic (schedule) for one local DAG file
 # ---------------------------------------------------------------------------
 
 # Echo the raw schedule token found in a DAG file, or nothing.
@@ -162,14 +141,6 @@ extract_schedule() {
   printf '%s' "$val"
 }
 
-# Echo email recipients (semicolon-joined) from a DAG file, or nothing.
-extract_emails() {
-  local f="$1"
-  grep -iE "email" "$f" 2>/dev/null \
-    | grep -oE "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}" \
-    | sort -u | paste -sd';' -
-}
-
 # ---------------------------------------------------------------------------
 # Per-environment inventory
 # ---------------------------------------------------------------------------
@@ -178,7 +149,7 @@ inventory_environment() {
   local project="$1" location="$2" env_name="$3"
   log "Environment ${project}/${env_name} @ ${location}"
 
-  # DAG source download (best effort) for schedule/email parsing.
+  # DAG source download (best effort) for schedule parsing.
   local dag_local_root="" tmpdir="" gcs_prefix=""
   gcs_prefix="$(gcloud composer environments describe "$env_name" \
     --project="$project" --location="$location" \
@@ -216,7 +187,7 @@ inventory_environment() {
   local count=0
   while IFS= read -r obj; do
     [[ -z "$obj" ]] && continue
-    local dag_id fpath paused active scheduled sched_time email_alert
+    local dag_id fpath paused active scheduled sched_time
     dag_id="$(jq -r '.dag_id // empty' <<<"$obj")"
     [[ -z "$dag_id" ]] && continue
     fpath="$(jq -r '.fileloc // .filepath // empty' <<<"$obj")"
@@ -229,8 +200,8 @@ inventory_environment() {
       *) active="Unknown" ;;
     esac
 
-    # Defaults when source is unavailable.
-    scheduled="Unknown"; sched_time=""; email_alert="Unknown"
+    # Default when source is unavailable.
+    scheduled="Unknown"; sched_time=""
 
     if [[ -n "$dag_local_root" && -n "$fpath" ]]; then
       # Map airflow fileloc -> local downloaded copy.
@@ -239,7 +210,7 @@ inventory_environment() {
       rel="${rel#./}"; rel="${rel#/}"
       local_file="$dag_local_root/$rel"
       if [[ -f "$local_file" ]]; then
-        local raw_sched emails
+        local raw_sched
         raw_sched="$(extract_schedule "$local_file")"
         if [[ -z "$raw_sched" ]]; then
           scheduled="Unknown"; sched_time=""
@@ -248,19 +219,11 @@ inventory_environment() {
         else
           scheduled="Yes"; sched_time="$raw_sched"
         fi
-        emails="$(extract_emails "$local_file")"
-        if [[ -n "$emails" ]]; then
-          email_alert="$emails"
-        elif grep -qE "email_on_(failure|retry)['\"]?[[:space:]]*[:=][[:space:]]*True" "$local_file" 2>/dev/null; then
-          email_alert="Yes (no address)"
-        else
-          email_alert="No"
-        fi
       fi
     fi
 
     write_row "$env_name" "$project" "$dag_id" "$fpath" \
-      "$active" "$scheduled" "$sched_time" "$email_alert"
+      "$active" "$scheduled" "$sched_time"
     count=$((count + 1))
   done < <(printf '%s' "$dags_json" | jq -c '.[]')
 
@@ -277,15 +240,15 @@ main() {
   mapfile -t LOCATIONS < <(resolve_locations)
 
   if [[ ${#PROJECTS[@]} -eq 0 ]]; then
-    die "No project specified. Use --projects / GCP_PROJECTS or set a gcloud default project."
+    die "No project specified. Pass a project id, --projects / GCP_PROJECTS, or set a gcloud default project."
   fi
 
   log "Projects : ${PROJECTS[*]}"
-  log "Locations: ${#LOCATIONS[@]} region(s)"
+  log "Locations: ${LOCATIONS[*]}"
   log "Output   : ${OUTPUT_CSV}"
 
   # CSV header.
-  printf 'Composer,Project,DAG_Name,Dag_path,Active?,Scheduled,Scheduled Time,Email Alert\n' >"$OUTPUT_CSV"
+  printf 'Composer,Project,DAG_Name,Dag_path,Active?,Scheduled,Scheduled Time\n' >"$OUTPUT_CSV"
 
   local total_envs=0
   for project in "${PROJECTS[@]}"; do

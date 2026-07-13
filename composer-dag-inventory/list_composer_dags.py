@@ -6,7 +6,7 @@ For every RUNNING Composer environment found in the target project(s), this
 script queries the environment's Airflow REST API (Composer 2 / Airflow 2.x)
 and emits a CSV row per DAG with the following columns:
 
-    Composer, Project, DAG_Name, Dag_path, Active?, Scheduled, Scheduled Time, Email Alert
+    Composer, Project, DAG_Name, Dag_path, Active?, Scheduled, Scheduled Time
 
 It is designed to run unattended from a CI pipeline (see .gitlab-ci.yml). All
 inputs are taken from environment variables / CLI flags and authentication uses
@@ -17,12 +17,16 @@ Auth model (Composer 2):
     cloud-platform scope. `google.auth.default()` picks up the service-account
     key referenced by GOOGLE_APPLICATION_CREDENTIALS (or the pipeline's
     Workload Identity). The identity needs at least:
-        - roles/composer.user           (list/describe envs, call Airflow API)
+        - roles/composer.user   (list/describe envs, call the Airflow API)
 
-Environment variables (all optional; CLI flags win):
-    GCP_PROJECTS        Comma-separated project IDs. Default: active gcloud project.
-    COMPOSER_LOCATIONS  Comma-separated regions to scan. Default: all compute regions.
-    OUTPUT_CSV          Output path. Default: composer_dags.csv
+Inputs (CLI flags win over environment variables):
+    project (positional)  GCP project id to scan.
+    --projects / GCP_PROJECTS
+                          Comma-separated project IDs (to scan several at once).
+                          Falls back to the active gcloud project.
+    --locations / COMPOSER_LOCATIONS
+                          Comma-separated regions to scan. Default: europe-west2.
+    --output / OUTPUT_CSV Output path. Default: composer_dags.csv
 
 The script is deliberately fault-tolerant: any per-region or per-environment
 error is logged and skipped rather than aborting the whole run, so a single
@@ -35,7 +39,6 @@ import argparse
 import csv
 import json
 import os
-import re
 import subprocess
 import sys
 from typing import Any, Dict, List, Optional
@@ -50,6 +53,7 @@ except ImportError:  # pragma: no cover - surfaced with a helpful message
     raise
 
 CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+DEFAULT_LOCATION = "europe-west2"
 
 CSV_HEADER = [
     "Composer",
@@ -59,7 +63,6 @@ CSV_HEADER = [
     "Active?",
     "Scheduled",
     "Scheduled Time",
-    "Email Alert",
 ]
 
 # Timetable summaries that mean "not on a schedule".
@@ -70,16 +73,6 @@ _UNSCHEDULED_SUMMARIES = {
     "manual",
     "never, external triggers only",
 }
-
-# Matches an email address, used to detect alert recipients in DAG source.
-_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
-# Matches `email=[...]` / `email="x"` or `'email': [...]` / `"email": "x"`.
-_EMAIL_ASSIGN_RE = re.compile(
-    r"""(?:['"]email['"]\s*:|(?<![A-Za-z_])email\s*=)\s*(\[[^\]]*\]|['"][^'"]*['"])""",
-    re.DOTALL,
-)
-# Matches both kwarg (`email_on_failure=True`) and dict (`'email_on_failure': True`) forms.
-_EMAIL_ON_FAILURE_RE = re.compile(r"""email_on_(?:failure|retry)['"]?\s*[:=]\s*True""")
 
 
 def log(msg: str) -> None:
@@ -118,8 +111,7 @@ def get_default_project() -> Optional[str]:
         return None
 
 
-def resolve_projects(cli_projects: Optional[str]) -> List[str]:
-    raw = cli_projects or os.environ.get("GCP_PROJECTS", "")
+def resolve_projects(raw: str) -> List[str]:
     projects = [p.strip() for p in raw.split(",") if p.strip()]
     if not projects:
         default = get_default_project()
@@ -127,8 +119,8 @@ def resolve_projects(cli_projects: Optional[str]) -> List[str]:
             projects = [default]
     if not projects:
         raise SystemExit(
-            "No project specified. Set --projects / GCP_PROJECTS or a gcloud "
-            "default project."
+            "No project specified. Pass a project id, --projects / GCP_PROJECTS, "
+            "or set a gcloud default project."
         )
     return projects
 
@@ -136,26 +128,7 @@ def resolve_projects(cli_projects: Optional[str]) -> List[str]:
 def resolve_locations(cli_locations: Optional[str]) -> List[str]:
     raw = cli_locations or os.environ.get("COMPOSER_LOCATIONS", "")
     locations = [l.strip() for l in raw.split(",") if l.strip()]
-    if locations:
-        return locations
-    # Fall back to enumerating every compute region.
-    try:
-        out = run_gcloud(["compute", "regions", "list", "--format=value(name)"])
-        regions = [r.strip() for r in out.splitlines() if r.strip()]
-        if regions:
-            return regions
-    except RuntimeError as exc:
-        log(f"WARN: could not list compute regions ({exc}); using fallback list.")
-    # Static fallback of common Composer regions.
-    return [
-        "us-central1", "us-east1", "us-east4", "us-west1", "us-west2",
-        "us-west3", "us-west4", "northamerica-northeast1", "southamerica-east1",
-        "europe-west1", "europe-west2", "europe-west3", "europe-west4",
-        "europe-west6", "europe-north1", "asia-east1", "asia-east2",
-        "asia-northeast1", "asia-northeast2", "asia-northeast3",
-        "asia-south1", "asia-southeast1", "asia-southeast2",
-        "australia-southeast1",
-    ]
+    return locations or [DEFAULT_LOCATION]
 
 
 def list_environments(project: str, location: str) -> List[Dict[str, Any]]:
@@ -279,7 +252,6 @@ class AirflowClient:
     def __init__(self, base_url: str, session: AuthorizedSession):
         self.base_url = base_url.rstrip("/")
         self.session = session
-        self._source_cache: Dict[str, str] = {}
 
     def _get(self, path: str, **kwargs: Any):
         url = f"{self.base_url}{path}"
@@ -303,44 +275,6 @@ class AirflowClient:
             if not batch or offset >= total:
                 break
         return dags
-
-    def get_source(self, file_token: str) -> str:
-        """Fetch (and cache) DAG source by file_token. Empty string on failure."""
-        if not file_token:
-            return ""
-        if file_token in self._source_cache:
-            return self._source_cache[file_token]
-        source = ""
-        try:
-            resp = self._get(
-                f"/api/v1/dagSources/{file_token}",
-                headers={"Accept": "text/plain"},
-            )
-            if resp.status_code == 200:
-                source = resp.text
-            else:
-                log(f"    WARN: dagSources {file_token[:12]}... -> {resp.status_code}")
-        except Exception as exc:  # network/etc. - non-fatal
-            log(f"    WARN: source fetch failed: {exc}")
-        self._source_cache[file_token] = source
-        return source
-
-
-def detect_email_alert(source: str) -> str:
-    """Return alert recipients found in DAG source, or 'No'/'Yes (no address)'."""
-    if not source:
-        return "Unknown"
-    addresses: List[str] = []
-    for match in _EMAIL_ASSIGN_RE.finditer(source):
-        addresses.extend(_EMAIL_RE.findall(match.group(1)))
-    # Dedupe while preserving order.
-    seen = set()
-    unique = [a for a in addresses if not (a in seen or seen.add(a))]
-    if unique:
-        return ";".join(unique)
-    if _EMAIL_ON_FAILURE_RE.search(source):
-        return "Yes (no address)"
-    return "No"
 
 
 def inventory_environment(
@@ -380,8 +314,6 @@ def inventory_environment(
             active = "No" if dag.get("is_paused", False) else "Yes"
             scheduled = is_scheduled(dag)
             schedule_time = format_schedule(dag) if scheduled else ""
-            source = client.get_source(dag.get("file_token", ""))
-            email_alert = detect_email_alert(source)
 
             writer.writerow(
                 [
@@ -392,7 +324,6 @@ def inventory_environment(
                     active,
                     "Yes" if scheduled else "No",
                     schedule_time,
-                    email_alert,
                 ]
             )
             rows += 1
@@ -419,14 +350,19 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         description="Inventory Cloud Composer DAGs into a CSV."
     )
     parser.add_argument(
+        "project",
+        nargs="?",
+        help="GCP project id to scan (or use --projects for several).",
+    )
+    parser.add_argument(
         "--projects",
-        help="Comma-separated GCP project IDs (default: GCP_PROJECTS env or "
+        help="Comma-separated GCP project IDs (default: GCP_PROJECTS env or the "
         "active gcloud project).",
     )
     parser.add_argument(
         "--locations",
-        help="Comma-separated regions to scan (default: COMPOSER_LOCATIONS env "
-        "or all compute regions).",
+        help=f"Comma-separated regions to scan (default: COMPOSER_LOCATIONS env "
+        f"or {DEFAULT_LOCATION}).",
     )
     parser.add_argument(
         "--output",
@@ -438,11 +374,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
-    projects = resolve_projects(args.projects)
+    raw_projects = args.project or args.projects or os.environ.get("GCP_PROJECTS", "")
+    projects = resolve_projects(raw_projects)
     locations = resolve_locations(args.locations)
 
     log(f"Projects : {', '.join(projects)}")
-    log(f"Locations: {len(locations)} region(s)")
+    log(f"Locations: {', '.join(locations)}")
     log(f"Output   : {args.output}")
 
     credentials = get_credentials()
