@@ -1,25 +1,20 @@
 #!/usr/bin/env bash
 #
-# Inventory Cloud Composer (Airflow) DAGs across a Google Cloud project using
-# only gcloud + jq. It never reads DAG files from GCS — every detail comes from
-# the Airflow CLI, invoked through `gcloud composer environments run` (Composer 2
-# runs this through the API, so no kubectl is required).
+# Inventory Cloud Composer (Airflow) DAGs across a Google Cloud project.
+#
+# It queries the Composer 2 Airflow **stable REST API** directly:
+#   * gcloud is used only to discover environments and to mint an access token
+#     (`gcloud auth print-access-token`).
+#   * curl fetches `/api/v1/dags` (paginated) — ONE bulk call per environment,
+#     so it does not slow down as the number of DAGs grows. It never reads DAG
+#     files from GCS and makes no per-DAG calls.
 #
 # For every RUNNING Composer environment it emits one CSV row per DAG:
 #   Composer, Project, DAG_Name, Dag_path, Active?, Scheduled, Scheduled Time
 #
-# Data sources (all via gcloud composer environments run):
-#   * DAG_Name / Dag_path / Active?  -> `airflow dags list -o json`   (1 call/env)
-#   * Scheduled / Scheduled Time      -> `airflow dags details <id> -o json`
-#                                        (1 call per DAG).
-#
-# NOTE: because schedule details are fetched per DAG, an environment with many
-# DAGs means many `environments run` calls. Scope with --locations / a single
-# project to keep runs quick.
-#
 # Auth: relies on the active gcloud account (in CI: a service-account key
 # activated via `gcloud auth activate-service-account`). The identity needs:
-#   - roles/composer.user   (list/describe/run)
+#   - roles/composer.user   (list environments + call the Airflow REST API)
 #
 # Config (flags override env vars):
 #   <project> (positional) / GCP_PROJECTS   Project id(s) to scan. Default: active gcloud project.
@@ -38,37 +33,48 @@ set -uo pipefail
 
 DEFAULT_LOCATION="europe-west2"
 CSV_HEADER="Composer,Project,DAG_Name,Dag_path,Active?,Scheduled,Scheduled Time"
+PAGE_LIMIT=100
 
-# jq program that turns an Airflow `dags details` object (or the same shape from
-# `dags list`) into a schedule display string. Empty output => not scheduled.
-SCHED_JQ='
+# jq program: for each DAG in an Airflow REST `/api/v1/dags` page, emit one
+# CSV row (Composer, Project, DAG_Name, Dag_path, Active?, Scheduled, Sched Time).
+# Expects --arg composer and --arg project.
+ROWS_JQ='
 def clean($s): ($s|tostring) as $t | ($t|ascii_downcase) as $l
   | if ($l=="" or $l=="none" or $l=="null" or $l=="manual"
         or $l=="never, external triggers only") then "" else $t end;
-(if type=="array" then (.[0] // {}) else . end) as $d
-| clean($d.timetable_summary // "") as $ts
-| if $ts != "" then $ts
-  else
-    ($d.schedule_interval) as $si
-    | if $si == null then ""
-      elif ($si|type)=="string" then clean($si)
-      elif ($si|type)=="object" then
-        ( ($si.__type // "") as $tp
-          | if $tp=="CronExpression" then (($si.value // "")|tostring)
-            elif $tp=="TimeDelta" then
-              ([ (if (($si.days)//0)!=0 then "\($si.days)d" else empty end),
-                 (if (($si.seconds)//0)!=0 then "\($si.seconds)s" else empty end),
-                 (if (($si.microseconds)//0)!=0 then "\($si.microseconds)m" else empty end)
-               ] | join(" ")) as $td
-              | (if $td=="" then "TimeDelta" else "every \($td)" end)
-            else (($si.value // "")|tostring) end )
-      else "" end
-  end'
+def sched:
+  clean(.timetable_summary // "") as $ts
+  | if $ts != "" then $ts
+    else
+      (.schedule_interval) as $si
+      | if $si == null then ""
+        elif ($si|type)=="string" then clean($si)
+        elif ($si|type)=="object" then
+          ( ($si.__type // "") as $tp
+            | if $tp=="CronExpression" then (($si.value // "")|tostring)
+              elif $tp=="TimeDelta" then
+                ([ (if (($si.days)//0)!=0 then "\($si.days)d" else empty end),
+                   (if (($si.seconds)//0)!=0 then "\($si.seconds)s" else empty end),
+                   (if (($si.microseconds)//0)!=0 then "\($si.microseconds)m" else empty end)
+                 ] | join(" ")) as $td
+                | (if $td=="" then "TimeDelta" else "every \($td)" end)
+              else (($si.value // "")|tostring) end )
+        else "" end
+    end;
+(.dags // [])[]
+| (sched) as $sc
+| [ $composer, $project, (.dag_id // ""), (.fileloc // .filepath // ""),
+    (if .is_paused then "No" else "Yes" end),
+    (if $sc == "" then "No" else "Yes" end),
+    $sc
+  ] | @csv'
 
-# Globals populated by parse_args().
+# Globals populated at runtime.
 PROJECTS_ARG=""
 LOCATIONS_ARG=""
 OUTPUT_CSV=""
+TOKEN=""
+TMP_BODY=""
 
 # ---------------------------------------------------------------------------
 # Generic helpers
@@ -91,80 +97,37 @@ split_csv() {
     | grep -v '^$'
 }
 
-# CSV-escape a single field: wrap in double quotes, doubling any inner quotes.
-csv_escape() {
-  local s=${1-}
-  s=${s//\"/\"\"}
-  printf '"%s"' "$s"
-}
-
-# Emit one CSV row (7 columns) with proper escaping.
-write_row() {
-  printf '%s,%s,%s,%s,%s,%s,%s\n' \
-    "$(csv_escape "${1-}")" "$(csv_escape "${2-}")" "$(csv_escape "${3-}")" \
-    "$(csv_escape "${4-}")" "$(csv_escape "${5-}")" "$(csv_escape "${6-}")" \
-    "$(csv_escape "${7-}")" >>"$OUTPUT_CSV"
-}
-
-# Pull the JSON object/array out of `environments run` output (which may carry a
-# line or two of preamble). Echoes clean JSON; returns non-zero if unparseable.
-extract_json() {
-  local raw json
-  raw="$(cat | tr -d '\r')"
-  json="$(printf '%s\n' "$raw" | sed -n '/^[[{]/,/^[]}]/p')"
-  # Note: `jq empty` returns 0 on EMPTY input, so require non-empty explicitly.
-  if [[ -n "$json" ]] && printf '%s' "$json" | jq empty >/dev/null 2>&1; then
-    printf '%s' "$json"; return 0
-  fi
-  if [[ -n "$raw" ]] && printf '%s' "$raw" | jq empty >/dev/null 2>&1; then
-    printf '%s' "$raw"; return 0
-  fi
-  return 1
-}
-
 # ---------------------------------------------------------------------------
-# gcloud / Airflow wrappers
+# Auth + Airflow REST API
 # ---------------------------------------------------------------------------
 
-# Run an Airflow CLI subcommand in an environment and emit clean JSON.
-#   airflow_run PROJECT LOCATION ENV <airflow subcommand + args...>
-# Returns non-zero if the output isn't parseable JSON.
-airflow_run() {
-  local project="$1" location="$2" env_name="$3"; shift 3
-  gcloud composer environments run "$env_name" \
-    --project="$project" --location="$location" \
-    "$@" 2>/dev/null | extract_json
+refresh_token() {
+  TOKEN="$(gcloud auth print-access-token 2>/dev/null)"
+  [[ -n "$TOKEN" ]]
 }
 
-# Echo "env_id,state" lines for every environment in a project+location.
+# GET a URL from the Airflow REST API using the cached token (refreshing once on
+# a 401). Echoes the response body; returns non-zero on any non-200 status.
+api_get() {
+  local url="$1" http
+  http="$(curl -sS -o "$TMP_BODY" -w '%{http_code}' \
+    -H "Authorization: Bearer $TOKEN" "$url" 2>/dev/null)"
+  if [[ "$http" == "401" ]] && refresh_token; then
+    http="$(curl -sS -o "$TMP_BODY" -w '%{http_code}' \
+      -H "Authorization: Bearer $TOKEN" "$url" 2>/dev/null)"
+  fi
+  if [[ "$http" != "200" ]]; then
+    log "  WARN: GET ${url} -> HTTP ${http:-000}"
+    return 1
+  fi
+  cat "$TMP_BODY"
+}
+
+# Echo "env_id<TAB>state<TAB>airflowUri" for every environment in project+location.
 list_environments() {
   gcloud composer environments list \
-    --project="$1" --locations="$2" \
-    --format='csv[no-heading](name.basename(),state)' 2>/dev/null
-}
-
-# Fetch a single DAG's schedule via `airflow dags details`.
-# Echoes: the schedule string, "" for unscheduled, or "__ERR__" if unavailable.
-dag_schedule() {
-  local project="$1" location="$2" env_name="$3" dag_id="$4" details
-  if ! details="$(airflow_run "$project" "$location" "$env_name" \
-        dags details -- "$dag_id" -o json)"; then
-    printf '__ERR__'; return 0
-  fi
-  printf '%s' "$details" | jq -r "$SCHED_JQ"
-}
-
-# ---------------------------------------------------------------------------
-# Field mapping
-# ---------------------------------------------------------------------------
-
-# Map Airflow's paused flag ("True"/"False"/true/false) to the Active? column.
-active_from_paused() {
-  case "$1" in
-    True|true|1)   printf 'No' ;;   # paused -> not active
-    False|false|0) printf 'Yes' ;;
-    *)             printf 'Unknown' ;;
-  esac
+    --project="$1" --locations="$2" --format=json 2>/dev/null \
+    | jq -r '.[]? | [(.name|split("/")|last), (.state // ""), (.config.airflowUri // "")] | @tsv'
 }
 
 # ---------------------------------------------------------------------------
@@ -195,6 +158,7 @@ parse_args() {
 require_tools() {
   command -v gcloud >/dev/null 2>&1 || die "gcloud not found on PATH"
   command -v jq >/dev/null 2>&1 || die "jq not found on PATH"
+  command -v curl >/dev/null 2>&1 || die "curl not found on PATH"
 }
 
 resolve_projects() {
@@ -223,46 +187,32 @@ resolve_locations() {
 # Inventory
 # ---------------------------------------------------------------------------
 
-# Turn one DAG's `dags list` object into a CSV row. Returns 1 if it has no id.
-inventory_dag() {
-  local project="$1" location="$2" env_name="$3" obj="$4"
-  local dag_id fpath paused active sched_out scheduled sched_time
-
-  dag_id="$(jq -r '.dag_id // empty' <<<"$obj")"
-  [[ -z "$dag_id" ]] && return 1
-  fpath="$(jq -r '.fileloc // .filepath // empty' <<<"$obj")"
-  paused="$(jq -r '(.paused // .is_paused) | tostring' <<<"$obj")"
-  active="$(active_from_paused "$paused")"
-
-  sched_out="$(dag_schedule "$project" "$location" "$env_name" "$dag_id")"
-  case "$sched_out" in
-    __ERR__) scheduled="Unknown"; sched_time="" ;;
-    "")      scheduled="No";      sched_time="" ;;
-    *)       scheduled="Yes";     sched_time="$sched_out" ;;
-  esac
-
-  write_row "$env_name" "$project" "$dag_id" "$fpath" \
-    "$active" "$scheduled" "$sched_time"
-}
-
+# Fetch every DAG for one environment (paginated) and append CSV rows.
 inventory_environment() {
-  local project="$1" location="$2" env_name="$3"
-  log "Environment ${project}/${env_name} @ ${location}"
+  local project="$1" env_name="$2" base="${3%/}"
+  log "Environment ${project}/${env_name}"
 
-  local dags_json
-  if ! dags_json="$(airflow_run "$project" "$location" "$env_name" \
-        dags list -- -o json)"; then
-    log "  WARN: no parseable DAG list for ${env_name}; skipping"
-    return 0
-  fi
-
-  local count=0 obj
-  while IFS= read -r obj; do
-    [[ -z "$obj" ]] && continue
-    if inventory_dag "$project" "$location" "$env_name" "$obj"; then
-      count=$((count + 1))
+  local offset=0 count=0 page rows page_meta dags_n total
+  while :; do
+    if ! page="$(api_get "${base}/api/v1/dags?limit=${PAGE_LIMIT}&offset=${offset}")"; then
+      log "  WARN: could not list DAGs for ${env_name}; skipping"
+      return 0
     fi
-  done < <(printf '%s' "$dags_json" | jq -c '.[]')
+    if ! printf '%s' "$page" | jq empty >/dev/null 2>&1; then
+      log "  WARN: unparseable DAG response for ${env_name}; skipping"
+      return 0
+    fi
+
+    rows="$(printf '%s' "$page" | jq -r --arg composer "$env_name" --arg project "$project" "$ROWS_JQ")"
+    [[ -n "$rows" ]] && printf '%s\n' "$rows" >>"$OUTPUT_CSV"
+
+    # DAG count + total in one jq call (tr strips the CR that Windows jq adds).
+    page_meta="$(printf '%s' "$page" | jq -r '"\((.dags // [])|length)\t\(.total_entries // 0)"' | tr -d '\r')"
+    IFS=$'\t' read -r dags_n total <<<"$page_meta"
+    count=$((count + dags_n))
+    offset=$((offset + PAGE_LIMIT))
+    { [[ "$dags_n" -eq 0 ]] || [[ "$offset" -ge "$total" ]]; } && break
+  done
 
   log "  ${count} DAG(s) written"
 }
@@ -283,24 +233,39 @@ main() {
     die "No project specified. Pass a project id, --projects / GCP_PROJECTS, or set a gcloud default project."
   fi
 
+  refresh_token || die "Could not obtain an access token via 'gcloud auth print-access-token'. Authenticate first (e.g. gcloud auth activate-service-account / gcloud auth login)."
+
+  TMP_BODY="$(mktemp)"
+  trap 'rm -f "$TMP_BODY"' EXIT
+
   log "Projects : ${PROJECTS[*]}"
   log "Locations: ${LOCATIONS[*]}"
   log "Output   : ${OUTPUT_CSV}"
 
   printf '%s\n' "$CSV_HEADER" >"$OUTPUT_CSV"
 
-  local total_envs=0 project location env_name state
+  local total_envs=0 project location env_name state airflow_uri
   for project in "${PROJECTS[@]}"; do
     for location in "${LOCATIONS[@]}"; do
-      while IFS=, read -r env_name state; do
+      while IFS=$'\t' read -r env_name state airflow_uri; do
         [[ -z "$env_name" ]] && continue
         if [[ "$state" != "RUNNING" ]]; then
           log "Environment ${project}/${env_name} @ ${location} state=${state}; skipping"
           continue
         fi
+        # Fall back to a describe if the list payload didn't carry the URI.
+        if [[ -z "$airflow_uri" ]]; then
+          airflow_uri="$(gcloud composer environments describe "$env_name" \
+            --project="$project" --location="$location" \
+            --format='value(config.airflowUri)' 2>/dev/null)"
+        fi
+        if [[ -z "$airflow_uri" ]]; then
+          log "Environment ${project}/${env_name}: no airflowUri; skipping"
+          continue
+        fi
         total_envs=$((total_envs + 1))
-        inventory_environment "$project" "$location" "$env_name"
-      done < <(list_environments "$project" "$location")
+        inventory_environment "$project" "$env_name" "$airflow_uri"
+      done < <(list_environments "$project" "$location" | tr -d '\r')
     done
   done
 

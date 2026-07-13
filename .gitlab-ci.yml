@@ -56,7 +56,7 @@ composer-dag-inventory-py:
       allow_failure: true
 
 # --------------------------------------------------------------------------
-# Bash implementation (gcloud CLI + jq).
+# Bash implementation (gcloud + curl + jq; same bulk REST API as the Python job).
 # Manual-only by default so scheduled pipelines don't run both inventories.
 # To schedule this one instead of / alongside the Python job, add the same
 # `if: $CI_PIPELINE_SOURCE == "schedule"` rule shown above.
@@ -64,7 +64,7 @@ composer-dag-inventory-py:
 composer-dag-inventory-bash:
   extends: .inventory_base
   script:
-    - apt-get update -qq && apt-get install -y -qq jq >/dev/null
+    - apt-get update -qq && apt-get install -y -qq jq curl >/dev/null
     - chmod +x composer-dag-inventory/list_composer_dags.sh
     - composer-dag-inventory/list_composer_dags.sh --output "$OUTPUT_CSV"
   artifacts:

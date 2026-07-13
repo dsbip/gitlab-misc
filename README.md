@@ -20,18 +20,16 @@ implementations — pick whichever fits your runner:
 | Script | Approach | Best for |
 | --- | --- | --- |
 | [`list_composer_dags.py`](composer-dag-inventory/list_composer_dags.py) | Airflow **stable REST API** (`/api/v1/dags`) via Application Default Credentials. | One bulk call per environment; needs `google-auth`. |
-| [`list_composer_dags.sh`](composer-dag-inventory/list_composer_dags.sh) | Airflow CLI via `gcloud composer environments run` (`dags list` + `dags details`). | No Python deps and no GCS access — just `gcloud` + `jq`. |
+| [`list_composer_dags.sh`](composer-dag-inventory/list_composer_dags.sh) | Same Airflow **stable REST API**, via `curl` with a token from `gcloud auth print-access-token`. | No Python deps — just `gcloud` + `curl` + `jq`. |
 
-Both emit the **same columns** and both read only from Airflow (never from the
-GCS bucket). Only `roles/composer.user` is required. The differences:
+Both hit the **same bulk endpoint** (`/api/v1/dags`, one paginated call per
+environment — so runtime does **not** grow per-DAG), emit the **same columns**,
+read only from Airflow (never from the GCS bucket), and need only
+`roles/composer.user`. They differ only in language/dependencies:
 
-- **Python** pulls every DAG's `is_paused` and `schedule_interval` in one
-  paginated `/api/v1/dags` call per environment.
-- **Bash** uses `airflow dags list` for `Active?`, then one
-  `airflow dags details <dag_id>` call **per DAG** for the schedule columns
-  (if a details call can't be read, that DAG's `Scheduled` reads `Unknown`).
-  Because it is one call per DAG, environments with many DAGs take longer —
-  scope with `--locations` / a single project to keep runs quick.
+- **Python** authenticates with `google-auth` (Application Default Credentials).
+- **Bash** authenticates with an access token from `gcloud auth print-access-token`
+  and parses the JSON with `jq`.
 
 ### Output columns
 
@@ -51,10 +49,10 @@ GCS bucket). Only `roles/composer.user` is required. The differences:
    for the target project(s), scanning **`europe-west2`** by default (override
    with `--locations` / `COMPOSER_LOCATIONS`).
 2. For each **RUNNING** environment, reads `config.airflowUri`.
-3. Calls the Composer 2 Airflow **stable REST API** (`/api/v1/dags`, paginated)
-   using Application Default Credentials — no IAP client ID juggling required.
-   (The Bash variant instead runs `airflow dags list` + `airflow dags details`
-   through `gcloud composer environments run` — no GCS access.)
+3. Calls the Composer 2 Airflow **stable REST API** (`/api/v1/dags`, paginated) —
+   one bulk call per environment, no IAP client ID juggling required. Python uses
+   Application Default Credentials; Bash uses `curl` with a
+   `gcloud auth print-access-token` bearer token. Neither reads from GCS.
 
 ### Requirements
 
@@ -84,7 +82,7 @@ python composer-dag-inventory/list_composer_dags.py \
   --output composer_dags.csv
 ```
 
-Or the dependency-free Bash version (needs `gcloud` and `jq`):
+Or the dependency-free Bash version (needs `gcloud`, `curl`, and `jq`):
 
 ```bash
 gcloud auth activate-service-account --key-file=/path/to/sa-key.json
