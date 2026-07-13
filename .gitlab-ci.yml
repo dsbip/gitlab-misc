@@ -7,10 +7,7 @@
 #
 # Prerequisites (Settings > CI/CD > Variables):
 #   GCP_SA_KEY   -> type "File". Value = the JSON key of a service account.
-#                   Python job needs roles/composer.user.
-#                   Bash job additionally needs
-#                     roles/composer.environmentAndStorageObjectViewer
-#                   (it reads DAG source from the environment's GCS bucket).
+#                   Both jobs need only roles/composer.user (neither reads GCS).
 #   GCP_PROJECTS -> (optional) comma-separated project IDs to scan.
 #                   Defaults to the service account's own project.
 #   COMPOSER_LOCATIONS -> (optional) comma-separated regions, e.g.

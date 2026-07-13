@@ -19,19 +19,19 @@ implementations — pick whichever fits your runner:
 
 | Script | Approach | Best for |
 | --- | --- | --- |
-| [`list_composer_dags.py`](composer-dag-inventory/list_composer_dags.py) | Airflow **stable REST API** (`/api/v1/dags`) via Application Default Credentials. | Accurate schedule straight from Airflow's runtime; needs `google-auth`. |
-| [`list_composer_dags.sh`](composer-dag-inventory/list_composer_dags.sh) | `gcloud composer environments run … dags list` + parses DAG source from the GCS bucket. | No Python deps — just `gcloud` + `jq`. |
+| [`list_composer_dags.py`](composer-dag-inventory/list_composer_dags.py) | Airflow **stable REST API** (`/api/v1/dags`) via Application Default Credentials. | One bulk call per environment; needs `google-auth`. |
+| [`list_composer_dags.sh`](composer-dag-inventory/list_composer_dags.sh) | Airflow CLI via `gcloud composer environments run` (`dags list` + `dags details`). | No Python deps and no GCS access — just `gcloud` + `jq`. |
 
-Both emit the **same columns**. The differences:
+Both emit the **same columns** and both read only from Airflow (never from the
+GCS bucket). Only `roles/composer.user` is required. The differences:
 
-- **Python** reads `is_paused` and `schedule_interval` from Airflow's runtime
-  metadata, so `Active?` / `Scheduled` / `Scheduled Time` are authoritative.
-  Only needs `roles/composer.user`.
-- **Bash** reads `Active?` from `airflow dags list`, but derives
-  `Scheduled` / `Scheduled Time` by parsing DAG source from the environment's
-  GCS bucket (heuristic; unreadable source → `Unknown`). It therefore also needs
-  read access to that bucket (`roles/composer.environmentAndStorageObjectViewer`)
-  and depends on `gcloud` + `jq` only.
+- **Python** pulls every DAG's `is_paused` and `schedule_interval` in one
+  paginated `/api/v1/dags` call per environment.
+- **Bash** uses `airflow dags list` for `Active?`, then one
+  `airflow dags details <dag_id>` call **per DAG** for the schedule columns
+  (if a details call can't be read, that DAG's `Scheduled` reads `Unknown`).
+  Because it is one call per DAG, environments with many DAGs take longer —
+  scope with `--locations` / a single project to keep runs quick.
 
 ### Output columns
 
@@ -53,8 +53,8 @@ Both emit the **same columns**. The differences:
 2. For each **RUNNING** environment, reads `config.airflowUri`.
 3. Calls the Composer 2 Airflow **stable REST API** (`/api/v1/dags`, paginated)
    using Application Default Credentials — no IAP client ID juggling required.
-   (The Bash variant instead runs `airflow dags list` and parses source from the
-   GCS bucket for the schedule columns.)
+   (The Bash variant instead runs `airflow dags list` + `airflow dags details`
+   through `gcloud composer environments run` — no GCS access.)
 
 ### Requirements
 

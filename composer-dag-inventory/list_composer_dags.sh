@@ -1,22 +1,25 @@
 #!/usr/bin/env bash
 #
 # Inventory Cloud Composer (Airflow) DAGs across a Google Cloud project using
-# only gcloud / gcloud storage / jq — no Python REST client.
+# only gcloud + jq. It never reads DAG files from GCS — every detail comes from
+# the Airflow CLI, invoked through `gcloud composer environments run` (Composer 2
+# runs this through the API, so no kubectl is required).
 #
 # For every RUNNING Composer environment it emits one CSV row per DAG:
 #   Composer, Project, DAG_Name, Dag_path, Active?, Scheduled, Scheduled Time
 #
-# Data sources:
-#   * DAG_Name / Dag_path / Active?  -> `airflow dags list -o json`, invoked via
-#     `gcloud composer environments run` (Composer 2, no kubectl required).
-#   * Scheduled / Scheduled Time -> parsed from the DAG *source*, downloaded once
-#     per environment from its GCS dags bucket. Best-effort heuristics; where the
-#     source can't be read they read "Unknown".
+# Data sources (all via gcloud composer environments run):
+#   * DAG_Name / Dag_path / Active?  -> `airflow dags list -o json`   (1 call/env)
+#   * Scheduled / Scheduled Time      -> `airflow dags details <id> -o json`
+#                                        (1 call per DAG).
+#
+# NOTE: because schedule details are fetched per DAG, an environment with many
+# DAGs means many `environments run` calls. Scope with --locations / a single
+# project to keep runs quick.
 #
 # Auth: relies on the active gcloud account (in CI: a service-account key
-# activated via `gcloud auth activate-service-account`). The identity needs
-#   - roles/composer.user                                   (list/describe/run)
-#   - roles/composer.environmentAndStorageObjectViewer      (read DAG source)
+# activated via `gcloud auth activate-service-account`). The identity needs:
+#   - roles/composer.user   (list/describe/run)
 #
 # Config (flags override env vars):
 #   <project> (positional) / GCP_PROJECTS   Project id(s) to scan. Default: active gcloud project.
@@ -30,6 +33,32 @@
 set -uo pipefail
 
 DEFAULT_LOCATION="europe-west2"
+
+# jq program that turns an Airflow `dags details` object (or the same shape from
+# `dags list`) into a schedule display string. Empty output => not scheduled.
+SCHED_JQ='
+def clean($s): ($s|tostring) as $t | ($t|ascii_downcase) as $l
+  | if ($l=="" or $l=="none" or $l=="null" or $l=="manual"
+        or $l=="never, external triggers only") then "" else $t end;
+(if type=="array" then (.[0] // {}) else . end) as $d
+| clean($d.timetable_summary // "") as $ts
+| if $ts != "" then $ts
+  else
+    ($d.schedule_interval) as $si
+    | if $si == null then ""
+      elif ($si|type)=="string" then clean($si)
+      elif ($si|type)=="object" then
+        ( ($si.__type // "") as $tp
+          | if $tp=="CronExpression" then (($si.value // "")|tostring)
+            elif $tp=="TimeDelta" then
+              ([ (if (($si.days)//0)!=0 then "\($si.days)d" else empty end),
+                 (if (($si.seconds)//0)!=0 then "\($si.seconds)s" else empty end),
+                 (if (($si.microseconds)//0)!=0 then "\($si.microseconds)m" else empty end)
+               ] | join(" ")) as $td
+              | (if $td=="" then "TimeDelta" else "every \($td)" end)
+            else (($si.value // "")|tostring) end )
+      else "" end
+  end'
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -52,6 +81,22 @@ write_row() {
     "$(csv_escape "${1-}")" "$(csv_escape "${2-}")" "$(csv_escape "${3-}")" \
     "$(csv_escape "${4-}")" "$(csv_escape "${5-}")" "$(csv_escape "${6-}")" \
     "$(csv_escape "${7-}")" >>"$OUTPUT_CSV"
+}
+
+# Pull the JSON object/array out of `environments run` output (which may carry a
+# line or two of preamble). Echoes clean JSON, or nothing if unparseable.
+extract_json() {
+  local raw json
+  raw="$(cat | tr -d '\r')"
+  json="$(printf '%s\n' "$raw" | sed -n '/^[[{]/,/^[]}]/p')"
+  # Note: `jq empty` returns 0 on EMPTY input, so require non-empty explicitly.
+  if [[ -n "$json" ]] && printf '%s' "$json" | jq empty >/dev/null 2>&1; then
+    printf '%s' "$json"; return 0
+  fi
+  if [[ -n "$raw" ]] && printf '%s' "$raw" | jq empty >/dev/null 2>&1; then
+    printf '%s' "$raw"; return 0
+  fi
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -85,16 +130,6 @@ done
 command -v gcloud >/dev/null 2>&1 || die "gcloud not found on PATH"
 command -v jq >/dev/null 2>&1 || die "jq not found on PATH"
 
-# Prefer 'gcloud storage'; fall back to gsutil for DAG source download.
-STORAGE_CP=""
-if gcloud storage --help >/dev/null 2>&1; then
-  STORAGE_CP="gcloud storage cp"
-elif command -v gsutil >/dev/null 2>&1; then
-  STORAGE_CP="gsutil -m cp"
-else
-  log "WARN: neither 'gcloud storage' nor 'gsutil' available; Scheduled columns will be Unknown."
-fi
-
 # ---------------------------------------------------------------------------
 # Resolve projects and locations
 # ---------------------------------------------------------------------------
@@ -123,22 +158,19 @@ resolve_locations() {
 }
 
 # ---------------------------------------------------------------------------
-# Source-parsing heuristic (schedule) for one local DAG file
+# Fetch a single DAG's schedule via `airflow dags details`.
+# Echoes: the schedule string, "" for unscheduled, or "__ERR__" if unavailable.
 # ---------------------------------------------------------------------------
 
-# Echo the raw schedule token found in a DAG file, or nothing.
-extract_schedule() {
-  local f="$1" line
-  # Matches: schedule="..."  schedule_interval='...'  schedule=@daily
-  #          schedule_interval=None   schedule=timedelta(days=1)
-  line="$(grep -hoE "schedule(_interval)?[[:space:]]*=[[:space:]]*(None|['\"][^'\"]*['\"]|@[A-Za-z_]+|(timedelta|relativedelta)\([^)]*\))" "$f" 2>/dev/null | head -n1)"
-  [[ -z "$line" ]] && return 0
-  # Strip the "schedule... =" prefix and any surrounding quotes.
-  local val
-  val="$(printf '%s' "$line" | sed -E "s/^schedule(_interval)?[[:space:]]*=[[:space:]]*//")"
-  val="${val%\'}"; val="${val#\'}"
-  val="${val%\"}"; val="${val#\"}"
-  printf '%s' "$val"
+dag_schedule() {
+  local project="$1" location="$2" env_name="$3" dag_id="$4"
+  local details
+  if ! details="$(gcloud composer environments run "$env_name" \
+        --project="$project" --location="$location" \
+        dags details -- "$dag_id" -o json 2>/dev/null | extract_json)"; then
+    printf '__ERR__'; return 0
+  fi
+  printf '%s' "$details" | jq -r "$SCHED_JQ"
 }
 
 # ---------------------------------------------------------------------------
@@ -149,45 +181,19 @@ inventory_environment() {
   local project="$1" location="$2" env_name="$3"
   log "Environment ${project}/${env_name} @ ${location}"
 
-  # DAG source download (best effort) for schedule parsing.
-  local dag_local_root="" tmpdir="" gcs_prefix=""
-  gcs_prefix="$(gcloud composer environments describe "$env_name" \
-    --project="$project" --location="$location" \
-    --format='value(config.dagGcsPrefix)' 2>/dev/null)"
-  if [[ -n "$gcs_prefix" && -n "$STORAGE_CP" ]]; then
-    tmpdir="$(mktemp -d)"
-    if $STORAGE_CP -r "${gcs_prefix%/}" "$tmpdir" >/dev/null 2>&1; then
-      # gs://bucket/dags -> $tmpdir/dags
-      dag_local_root="$tmpdir/$(basename "$gcs_prefix")"
-    else
-      log "  WARN: could not download DAG source from ${gcs_prefix}"
-    fi
-  fi
-
   # List DAGs via the Airflow CLI (Composer 2 runs this through the API).
-  local raw dags_json
-  raw="$(gcloud composer environments run "$env_name" \
-    --project="$project" --location="$location" \
-    dags list -- -o json 2>/dev/null | tr -d '\r')"
-  # Extract just the JSON array (airflow pretty-prints '[' and ']' at column 0,
-  # possibly after a line or two of gcloud preamble).
-  dags_json="$(printf '%s\n' "$raw" | sed -n '/^\[/,/^\]/p')"
-  if ! printf '%s' "$dags_json" | jq empty >/dev/null 2>&1; then
-    # Fall back to treating the whole payload as JSON (no-preamble case).
-    if printf '%s' "$raw" | jq empty >/dev/null 2>&1; then
-      dags_json="$raw"
-    fi
-  fi
-  if [[ -z "$dags_json" ]] || ! printf '%s' "$dags_json" | jq empty >/dev/null 2>&1; then
+  local dags_json
+  if ! dags_json="$(gcloud composer environments run "$env_name" \
+        --project="$project" --location="$location" \
+        dags list -- -o json 2>/dev/null | extract_json)"; then
     log "  WARN: no parseable DAG list for ${env_name}; skipping"
-    [[ -n "$tmpdir" ]] && rm -rf "$tmpdir"
     return 0
   fi
 
   local count=0
   while IFS= read -r obj; do
     [[ -z "$obj" ]] && continue
-    local dag_id fpath paused active scheduled sched_time
+    local dag_id fpath paused active scheduled sched_time sched_out
     dag_id="$(jq -r '.dag_id // empty' <<<"$obj")"
     [[ -z "$dag_id" ]] && continue
     fpath="$(jq -r '.fileloc // .filepath // empty' <<<"$obj")"
@@ -200,26 +206,14 @@ inventory_environment() {
       *) active="Unknown" ;;
     esac
 
-    # Default when source is unavailable.
-    scheduled="Unknown"; sched_time=""
-
-    if [[ -n "$dag_local_root" && -n "$fpath" ]]; then
-      # Map airflow fileloc -> local downloaded copy.
-      local rel local_file
-      rel="${fpath#/home/airflow/gcs/dags/}"
-      rel="${rel#./}"; rel="${rel#/}"
-      local_file="$dag_local_root/$rel"
-      if [[ -f "$local_file" ]]; then
-        local raw_sched
-        raw_sched="$(extract_schedule "$local_file")"
-        if [[ -z "$raw_sched" ]]; then
-          scheduled="Unknown"; sched_time=""
-        elif [[ "${raw_sched,,}" == "none" ]]; then
-          scheduled="No"; sched_time=""
-        else
-          scheduled="Yes"; sched_time="$raw_sched"
-        fi
-      fi
+    # Schedule via `dags details`.
+    sched_out="$(dag_schedule "$project" "$location" "$env_name" "$dag_id")"
+    if [[ "$sched_out" == "__ERR__" ]]; then
+      scheduled="Unknown"; sched_time=""
+    elif [[ -z "$sched_out" ]]; then
+      scheduled="No"; sched_time=""
+    else
+      scheduled="Yes"; sched_time="$sched_out"
     fi
 
     write_row "$env_name" "$project" "$dag_id" "$fpath" \
@@ -228,7 +222,6 @@ inventory_environment() {
   done < <(printf '%s' "$dags_json" | jq -c '.[]')
 
   log "  ${count} DAG(s) written"
-  [[ -n "$tmpdir" ]] && rm -rf "$tmpdir"
 }
 
 # ---------------------------------------------------------------------------
