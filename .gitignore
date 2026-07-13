@@ -1,0 +1,17 @@
+# Generated inventory output
+composer_dags.csv
+*.csv
+
+# Credentials — never commit
+*.json.key
+gcp-key.json
+service-account*.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local editor / assistant tooling
+.claude/
