@@ -1,43 +1,77 @@
 # GitLab CI pipeline: inventory Cloud Composer DAGs into a downloadable CSV.
 #
-# Prerequisites (configure in Settings > CI/CD > Variables):
-#   GCP_SA_KEY   -> type "File". Value = the JSON key of a service account with
-#                  roles/composer.user on the target project(s).
+# Two interchangeable jobs produce the same CSV:
+#   composer-dag-inventory-py    -> Python script (Airflow REST API)
+#   composer-dag-inventory-bash  -> Bash script (gcloud CLI + jq)
+# Each publishes `composer_dags.csv` as its own downloadable artifact.
+#
+# Prerequisites (Settings > CI/CD > Variables):
+#   GCP_SA_KEY   -> type "File". Value = the JSON key of a service account.
+#                   Python job needs roles/composer.user.
+#                   Bash job additionally needs
+#                     roles/composer.environmentAndStorageObjectViewer
+#                   (it reads DAG source from the environment's GCS bucket).
 #   GCP_PROJECTS -> (optional) comma-separated project IDs to scan.
 #                   Defaults to the service account's own project.
 #   COMPOSER_LOCATIONS -> (optional) comma-separated regions, e.g.
 #                   "us-central1,europe-west1". Defaults to all compute regions.
 #
-# The job produces `composer_dags.csv` as a build artifact, downloadable from
-# the job page (Job artifacts > Download) or via the API.
+# Download the CSV from the job page (Job artifacts > Download) or the API.
 
 stages:
   - inventory
 
-composer-dag-inventory:
+# --------------------------------------------------------------------------
+# Shared configuration: image, auth, artifact + trigger rules.
+# --------------------------------------------------------------------------
+.inventory_base:
   stage: inventory
   image: google/cloud-sdk:slim
   variables:
     OUTPUT_CSV: "composer_dags.csv"
   before_script:
-    - pip3 install --no-cache-dir -r composer-dag-inventory/requirements.txt
-      || pip3 install --break-system-packages --no-cache-dir -r composer-dag-inventory/requirements.txt
-    # GCP_SA_KEY is a File-type variable: the variable value is a path to the key.
+    # GCP_SA_KEY is a File-type variable: its value is a path to the key file.
     - export GOOGLE_APPLICATION_CREDENTIALS="$GCP_SA_KEY"
     - gcloud auth activate-service-account --key-file="$GOOGLE_APPLICATION_CREDENTIALS"
     - gcloud config set project "$(python3 -c "import json,os;print(json.load(open(os.environ['GCP_SA_KEY']))['project_id'])")"
-  script:
-    - python3 composer-dag-inventory/list_composer_dags.py --output "$OUTPUT_CSV"
   artifacts:
-    name: "composer-dag-inventory-${CI_COMMIT_SHORT_SHA}"
     paths:
       - composer_dags.csv
     expire_in: 30 days
     when: always
+
+# --------------------------------------------------------------------------
+# Python implementation (Airflow stable REST API).
+# Runs automatically on scheduled pipelines; manual "play" button elsewhere.
+# --------------------------------------------------------------------------
+composer-dag-inventory-py:
+  extends: .inventory_base
+  script:
+    - pip3 install --no-cache-dir -r composer-dag-inventory/requirements.txt
+      || pip3 install --break-system-packages --no-cache-dir -r composer-dag-inventory/requirements.txt
+    - python3 composer-dag-inventory/list_composer_dags.py --output "$OUTPUT_CSV"
+  artifacts:
+    name: "composer-dags-py-${CI_COMMIT_SHORT_SHA}"
   rules:
-    # Run automatically for scheduled pipelines...
     - if: '$CI_PIPELINE_SOURCE == "schedule"'
       when: always
-    # ...and offer a manual "play" button everywhere else.
+    - when: manual
+      allow_failure: true
+
+# --------------------------------------------------------------------------
+# Bash implementation (gcloud CLI + jq).
+# Manual-only by default so scheduled pipelines don't run both inventories.
+# To schedule this one instead of / alongside the Python job, add the same
+# `if: $CI_PIPELINE_SOURCE == "schedule"` rule shown above.
+# --------------------------------------------------------------------------
+composer-dag-inventory-bash:
+  extends: .inventory_base
+  script:
+    - apt-get update -qq && apt-get install -y -qq jq >/dev/null
+    - chmod +x composer-dag-inventory/list_composer_dags.sh
+    - composer-dag-inventory/list_composer_dags.sh --output "$OUTPUT_CSV"
+  artifacts:
+    name: "composer-dags-bash-${CI_COMMIT_SHORT_SHA}"
+  rules:
     - when: manual
       allow_failure: true
