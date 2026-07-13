@@ -96,8 +96,10 @@ resolve_projects() {
   fi
   local default
   default="$(gcloud config get-value project 2>/dev/null)"
-  [[ -n "$default" && "$default" != "(unset)" ]] || die "No project set. Use --projects / GCP_PROJECTS or set a gcloud default project."
-  printf '%s\n' "$default"
+  # Print the default project if one is configured; main() errors if none.
+  if [[ -n "$default" && "$default" != "(unset)" ]]; then
+    printf '%s\n' "$default"
+  fi
 }
 
 resolve_locations() {
@@ -195,9 +197,16 @@ inventory_environment() {
   local raw dags_json
   raw="$(gcloud composer environments run "$env_name" \
     --project="$project" --location="$location" \
-    dags list -- -o json 2>/dev/null)"
-  # Extract just the JSON array (airflow pretty-prints '[' and ']' at column 0).
+    dags list -- -o json 2>/dev/null | tr -d '\r')"
+  # Extract just the JSON array (airflow pretty-prints '[' and ']' at column 0,
+  # possibly after a line or two of gcloud preamble).
   dags_json="$(printf '%s\n' "$raw" | sed -n '/^\[/,/^\]/p')"
+  if ! printf '%s' "$dags_json" | jq empty >/dev/null 2>&1; then
+    # Fall back to treating the whole payload as JSON (no-preamble case).
+    if printf '%s' "$raw" | jq empty >/dev/null 2>&1; then
+      dags_json="$raw"
+    fi
+  fi
   if [[ -z "$dags_json" ]] || ! printf '%s' "$dags_json" | jq empty >/dev/null 2>&1; then
     log "  WARN: no parseable DAG list for ${env_name}; skipping"
     [[ -n "$tmpdir" ]] && rm -rf "$tmpdir"
@@ -242,7 +251,7 @@ inventory_environment() {
         emails="$(extract_emails "$local_file")"
         if [[ -n "$emails" ]]; then
           email_alert="$emails"
-        elif grep -qE "email_on_(failure|retry)[[:space:]]*=[[:space:]]*True" "$local_file" 2>/dev/null; then
+        elif grep -qE "email_on_(failure|retry)['\"]?[[:space:]]*[:=][[:space:]]*True" "$local_file" 2>/dev/null; then
           email_alert="Yes (no address)"
         else
           email_alert="No"
@@ -266,6 +275,10 @@ inventory_environment() {
 main() {
   mapfile -t PROJECTS < <(resolve_projects)
   mapfile -t LOCATIONS < <(resolve_locations)
+
+  if [[ ${#PROJECTS[@]} -eq 0 ]]; then
+    die "No project specified. Use --projects / GCP_PROJECTS or set a gcloud default project."
+  fi
 
   log "Projects : ${PROJECTS[*]}"
   log "Locations: ${#LOCATIONS[@]} region(s)"

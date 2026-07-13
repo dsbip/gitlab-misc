@@ -18,12 +18,15 @@ Auth model (Composer 2):
     key referenced by GOOGLE_APPLICATION_CREDENTIALS (or the pipeline's
     Workload Identity). The identity needs at least:
         - roles/composer.user           (list/describe envs, call Airflow API)
-        - roles/composer.environmentAndStorageObjectViewer  (optional)
 
 Environment variables (all optional; CLI flags win):
     GCP_PROJECTS        Comma-separated project IDs. Default: active gcloud project.
     COMPOSER_LOCATIONS  Comma-separated regions to scan. Default: all compute regions.
     OUTPUT_CSV          Output path. Default: composer_dags.csv
+
+The script is deliberately fault-tolerant: any per-region or per-environment
+error is logged and skipped rather than aborting the whole run, so a single
+inaccessible environment never blocks the inventory.
 """
 
 from __future__ import annotations
@@ -35,7 +38,7 @@ import os
 import re
 import subprocess
 import sys
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 
 try:
     import google.auth
@@ -59,14 +62,24 @@ CSV_HEADER = [
     "Email Alert",
 ]
 
+# Timetable summaries that mean "not on a schedule".
+_UNSCHEDULED_SUMMARIES = {
+    "",
+    "none",
+    "null",
+    "manual",
+    "never, external triggers only",
+}
+
 # Matches an email address, used to detect alert recipients in DAG source.
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
-# Matches `email=[...]` or `'email': [...]` / `"email": [...]` assignments.
+# Matches `email=[...]` / `email="x"` or `'email': [...]` / `"email": "x"`.
 _EMAIL_ASSIGN_RE = re.compile(
     r"""(?:['"]email['"]\s*:|(?<![A-Za-z_])email\s*=)\s*(\[[^\]]*\]|['"][^'"]*['"])""",
     re.DOTALL,
 )
-_EMAIL_ON_FAILURE_RE = re.compile(r"email_on_(?:failure|retry)\s*=\s*True")
+# Matches both kwarg (`email_on_failure=True`) and dict (`'email_on_failure': True`) forms.
+_EMAIL_ON_FAILURE_RE = re.compile(r"""email_on_(?:failure|retry)['"]?\s*[:=]\s*True""")
 
 
 def log(msg: str) -> None:
@@ -76,15 +89,20 @@ def log(msg: str) -> None:
 
 
 def run_gcloud(args: List[str]) -> str:
-    """Run a gcloud command and return stdout, raising on failure."""
+    """Run a gcloud command and return stdout, raising RuntimeError on failure."""
     cmd = ["gcloud", *args]
-    proc = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        # gcloud on Windows is a .cmd shim; shell=True lets it resolve on PATH.
-        shell=(os.name == "nt"),
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            # gcloud on Windows is a .cmd shim; shell=True lets it resolve on PATH.
+            shell=(os.name == "nt"),
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            "gcloud not found on PATH. Install the Google Cloud SDK."
+        ) from exc
     if proc.returncode != 0:
         raise RuntimeError(
             f"`{' '.join(cmd)}` failed ({proc.returncode}): {proc.stderr.strip()}"
@@ -122,9 +140,7 @@ def resolve_locations(cli_locations: Optional[str]) -> List[str]:
         return locations
     # Fall back to enumerating every compute region.
     try:
-        out = run_gcloud(
-            ["compute", "regions", "list", "--format=value(name)"]
-        )
+        out = run_gcloud(["compute", "regions", "list", "--format=value(name)"])
         regions = [r.strip() for r in out.splitlines() if r.strip()]
         if regions:
             return regions
@@ -154,63 +170,107 @@ def list_environments(project: str, location: str) -> List[Dict[str, Any]]:
             ]
         )
     except RuntimeError as exc:
-        # A location with no Composer/API disabled is normal; log and skip.
+        # A location with no Composer, or the API disabled, is normal; skip it.
         log(f"  skip {project}/{location}: {exc}")
         return []
     try:
-        return json.loads(out) or []
+        data = json.loads(out)
     except json.JSONDecodeError:
         return []
+    return data or []
 
 
-def describe_environment(name: str) -> Optional[Dict[str, Any]]:
-    """Full describe of an environment given its fully-qualified name."""
+def describe_environment(
+    env_id: str, project: str, location: str
+) -> Optional[Dict[str, Any]]:
+    """Describe an environment by its short id + explicit project/location."""
     try:
         out = run_gcloud(
-            ["composer", "environments", "describe", name, "--format=json"]
+            [
+                "composer", "environments", "describe", env_id,
+                f"--project={project}",
+                f"--location={location}",
+                "--format=json",
+            ]
         )
         return json.loads(out)
     except (RuntimeError, json.JSONDecodeError) as exc:
-        log(f"  WARN: describe failed for {name}: {exc}")
+        log(f"  WARN: describe failed for {env_id}: {exc}")
         return None
+
+
+def parse_env_name(name: str) -> Optional[Dict[str, str]]:
+    """Split projects/P/locations/L/environments/E into its parts."""
+    parts = name.split("/")
+    if len(parts) >= 6 and parts[0] == "projects" and parts[4] == "environments":
+        return {"project": parts[1], "location": parts[3], "env_id": parts[5]}
+    return None
+
+
+def get_airflow_uri(env: Dict[str, Any]) -> Optional[str]:
+    """Resolve an environment's Airflow URI, from the list payload or a describe."""
+    uri = (env.get("config") or {}).get("airflowUri")
+    if uri:
+        return uri
+    parts = parse_env_name(env.get("name", ""))
+    if not parts:
+        return None
+    detail = describe_environment(parts["env_id"], parts["project"], parts["location"])
+    if not detail:
+        return None
+    return (detail.get("config") or {}).get("airflowUri")
+
+
+def _format_timedelta(sched: Dict[str, Any]) -> str:
+    parts = []
+    for unit in ("days", "seconds", "microseconds"):
+        val = sched.get(unit)
+        if val:
+            parts.append(f"{val}{unit[0]}")
+    return "every " + " ".join(parts) if parts else "TimeDelta"
 
 
 def format_schedule(dag: Dict[str, Any]) -> str:
     """Render an Airflow schedule into a human-readable string."""
-    # Airflow >= 2.4 exposes a ready-made summary.
-    summary = dag.get("timetable_summary")
-    if summary:
-        return str(summary)
-
     sched = dag.get("schedule_interval")
-    if sched is None:
-        return ""
-    if isinstance(sched, str):
-        return sched
     if isinstance(sched, dict):
         stype = sched.get("__type", "")
-        if stype == "CronExpression":
-            return sched.get("value") or ""
+        if stype == "CronExpression" and sched.get("value"):
+            return str(sched["value"])
         if stype == "TimeDelta":
-            parts = []
-            for unit in ("days", "seconds", "microseconds"):
-                val = sched.get(unit)
-                if val:
-                    parts.append(f"{val}{unit[0]}")
-            return "every " + " ".join(parts) if parts else "TimeDelta"
+            return _format_timedelta(sched)
         if stype == "RelativeDelta":
-            return "RelativeDelta"
-        return sched.get("value") or json.dumps(sched)
-    return str(sched)
+            summary = dag.get("timetable_summary")
+            return str(summary) if summary else "RelativeDelta"
+    elif isinstance(sched, str) and sched.strip().lower() not in ("", "none", "null"):
+        return sched
+
+    # Fall back to the timetable summary (Airflow >= 2.4), e.g. "Dataset".
+    summary = dag.get("timetable_summary")
+    if summary and str(summary).strip().lower() not in _UNSCHEDULED_SUMMARIES:
+        return str(summary)
+    return ""
 
 
 def is_scheduled(dag: Dict[str, Any]) -> bool:
-    if dag.get("timetable_summary"):
-        summary = str(dag["timetable_summary"]).strip().lower()
-        if summary in ("", "none", "never, external triggers only"):
-            return False
+    """True if the DAG runs on any schedule (cron, interval, dataset, ...)."""
+    sched = dag.get("schedule_interval")
+    if isinstance(sched, dict):
+        if sched.get("__type") == "CronExpression":
+            if sched.get("value"):
+                return True
+        else:
+            # TimeDelta / RelativeDelta are real schedules.
+            return True
+    elif isinstance(sched, str):
+        if sched.strip().lower() not in ("", "none", "null"):
+            return True
+    elif sched is not None:
         return True
-    return dag.get("schedule_interval") is not None
+
+    # schedule_interval is null/empty; a non-trivial timetable still counts.
+    summary = str(dag.get("timetable_summary") or "").strip().lower()
+    return bool(summary) and summary not in _UNSCHEDULED_SUMMARIES
 
 
 class AirflowClient:
@@ -240,7 +300,7 @@ class AirflowClient:
             dags.extend(batch)
             total = payload.get("total_entries", len(dags))
             offset += limit
-            if offset >= total or not batch:
+            if not batch or offset >= total:
                 break
         return dags
 
@@ -259,10 +319,7 @@ class AirflowClient:
             if resp.status_code == 200:
                 source = resp.text
             else:
-                log(
-                    f"    WARN: dagSources {file_token[:12]}... -> "
-                    f"{resp.status_code}"
-                )
+                log(f"    WARN: dagSources {file_token[:12]}... -> {resp.status_code}")
         except Exception as exc:  # network/etc. - non-fatal
             log(f"    WARN: source fetch failed: {exc}")
         self._source_cache[file_token] = source
@@ -287,11 +344,14 @@ def detect_email_alert(source: str) -> str:
 
 
 def inventory_environment(
-    env: Dict[str, Any], project: str, writer: csv.writer
+    env: Dict[str, Any],
+    project: str,
+    session: AuthorizedSession,
+    writer: "csv._writer",
 ) -> int:
     """Query one environment's DAGs and write CSV rows. Returns row count."""
     name = env.get("name", "")
-    short_name = name.split("/")[-1] if name else env.get("name", "unknown")
+    short_name = name.split("/")[-1] if name else "unknown"
     state = env.get("state", "UNKNOWN")
 
     log(f"Environment {project}/{short_name} (state={state})")
@@ -299,20 +359,12 @@ def inventory_environment(
         log("  not RUNNING, skipping")
         return 0
 
-    detail = describe_environment(name) if name else env
-    airflow_uri = (
-        (detail or {}).get("config", {}).get("airflowUri")
-        if detail
-        else None
-    )
+    airflow_uri = get_airflow_uri(env)
     if not airflow_uri:
         log(f"  WARN: no airflowUri for {short_name}, skipping")
         return 0
 
-    credentials, _ = google.auth.default(scopes=[CLOUD_PLATFORM_SCOPE])
-    session = AuthorizedSession(credentials)
     client = AirflowClient(airflow_uri, session)
-
     try:
         dags = client.list_dags()
     except Exception as exc:
@@ -322,28 +374,44 @@ def inventory_environment(
     log(f"  {len(dags)} DAG(s) found")
     rows = 0
     for dag in dags:
-        dag_id = dag.get("dag_id", "")
-        fileloc = dag.get("fileloc") or dag.get("filepath") or ""
-        active = "No" if dag.get("is_paused", False) else "Yes"
-        scheduled = "Yes" if is_scheduled(dag) else "No"
-        schedule_time = format_schedule(dag) if scheduled == "Yes" else ""
-        source = client.get_source(dag.get("file_token", ""))
-        email_alert = detect_email_alert(source)
+        try:
+            dag_id = dag.get("dag_id", "")
+            fileloc = dag.get("fileloc") or dag.get("filepath") or ""
+            active = "No" if dag.get("is_paused", False) else "Yes"
+            scheduled = is_scheduled(dag)
+            schedule_time = format_schedule(dag) if scheduled else ""
+            source = client.get_source(dag.get("file_token", ""))
+            email_alert = detect_email_alert(source)
 
-        writer.writerow(
-            [
-                short_name,
-                project,
-                dag_id,
-                fileloc,
-                active,
-                scheduled,
-                schedule_time,
-                email_alert,
-            ]
-        )
-        rows += 1
+            writer.writerow(
+                [
+                    short_name,
+                    project,
+                    dag_id,
+                    fileloc,
+                    active,
+                    "Yes" if scheduled else "No",
+                    schedule_time,
+                    email_alert,
+                ]
+            )
+            rows += 1
+        except Exception as exc:  # never let one bad DAG abort the environment
+            log(f"    WARN: skipped DAG {dag.get('dag_id', '?')}: {exc}")
     return rows
+
+
+def get_credentials() -> Optional[Any]:
+    try:
+        creds, _ = google.auth.default(scopes=[CLOUD_PLATFORM_SCOPE])
+        return creds
+    except Exception as exc:
+        log(f"ERROR: could not obtain Google credentials: {exc}")
+        log(
+            "Set GOOGLE_APPLICATION_CREDENTIALS to a service-account key, or run "
+            "`gcloud auth application-default login`."
+        )
+        return None
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -377,18 +445,29 @@ def main(argv: Optional[List[str]] = None) -> int:
     log(f"Locations: {len(locations)} region(s)")
     log(f"Output   : {args.output}")
 
+    credentials = get_credentials()
+
     total_rows = 0
     total_envs = 0
     with open(args.output, "w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(CSV_HEADER)
 
+        if credentials is None:
+            log("No credentials: wrote header only.")
+            return 1
+
+        session = AuthorizedSession(credentials)
         for project in projects:
             for location in locations:
-                envs = list_environments(project, location)
-                for env in envs:
+                for env in list_environments(project, location):
                     total_envs += 1
-                    total_rows += inventory_environment(env, project, writer)
+                    try:
+                        total_rows += inventory_environment(
+                            env, project, session, writer
+                        )
+                    except Exception as exc:  # defensive: never abort the run
+                        log(f"  ERROR: environment failed: {exc}")
 
     log(f"\nDone: {total_rows} DAG row(s) across {total_envs} environment(s).")
     log(f"CSV written to {args.output}")
