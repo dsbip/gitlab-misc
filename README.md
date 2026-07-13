@@ -6,7 +6,7 @@ Miscellaneous scripts and GitLab CI pipelines for operational tasks.
 
 | Path | Description |
 | --- | --- |
-| [`composer-dag-inventory/`](composer-dag-inventory/) | Inventory all DAGs across every running Cloud Composer environment in a GCP project and export a CSV. |
+| [`composer-dag-inventory/`](composer-dag-inventory/) | Inventory all DAGs across every running Cloud Composer environment in a GCP project and export a CSV. Two implementations: Python (Airflow REST API) and Bash (gcloud CLI). |
 | [`.gitlab-ci.yml`](.gitlab-ci.yml) | Pipeline that runs the inventory and publishes the CSV as a downloadable artifact. |
 
 ---
@@ -14,8 +14,24 @@ Miscellaneous scripts and GitLab CI pipelines for operational tasks.
 ## Composer DAG Inventory
 
 Discovers every **RUNNING** Cloud Composer environment in the target GCP
-project(s), queries each environment's Airflow REST API, and writes one CSV row
-per DAG.
+project(s) and writes one CSV row per DAG. There are two interchangeable
+implementations — pick whichever fits your runner:
+
+| Script | Approach | Best for |
+| --- | --- | --- |
+| [`list_composer_dags.py`](composer-dag-inventory/list_composer_dags.py) | Airflow **stable REST API** (`/api/v1/dags`) via Application Default Credentials. | Accurate schedule straight from Airflow's runtime; needs `google-auth`. |
+| [`list_composer_dags.sh`](composer-dag-inventory/list_composer_dags.sh) | `gcloud composer environments run … dags list` + parses DAG source from the GCS bucket. | No Python deps — just `gcloud` + `jq`. |
+
+Both emit the **same columns**. The differences:
+
+- **Python** reads `is_paused` and `schedule_interval` from Airflow's runtime
+  metadata (authoritative for `Active?` / `Scheduled` / `Scheduled Time`) and
+  parses source only for `Email Alert`.
+- **Bash** reads `Active?` from `airflow dags list`, but derives
+  `Scheduled` / `Scheduled Time` **and** `Email Alert` by parsing DAG source
+  from the environment's GCS bucket (heuristic; unreadable source → `Unknown`).
+  It needs read access to that bucket (`roles/composer.environmentAndStorageObjectViewer`)
+  and depends on `gcloud` + `jq` only.
 
 ### Output columns
 
@@ -72,8 +88,20 @@ python composer-dag-inventory/list_composer_dags.py \
   --output composer_dags.csv
 ```
 
+Or the dependency-free Bash version (needs `gcloud` and `jq`):
+
+```bash
+gcloud auth activate-service-account --key-file=/path/to/sa-key.json
+chmod +x composer-dag-inventory/list_composer_dags.sh
+
+composer-dag-inventory/list_composer_dags.sh \
+  --projects my-proj-a,my-proj-b \
+  --locations us-central1,europe-west1 \
+  --output composer_dags.csv
+```
+
 Configuration can also come from environment variables: `GCP_PROJECTS`,
-`COMPOSER_LOCATIONS`, `OUTPUT_CSV`.
+`COMPOSER_LOCATIONS`, `OUTPUT_CSV` (both scripts honor them).
 
 > **Tip:** scanning *all* compute regions issues one `gcloud composer
 > environments list` per region. Set `--locations` / `COMPOSER_LOCATIONS` to the
