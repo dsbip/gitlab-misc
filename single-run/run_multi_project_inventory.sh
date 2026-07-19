@@ -64,6 +64,18 @@ usage() {
   grep '^#' "$0" | grep -v '^#!' | sed 's/^# \{0,1\}//'
 }
 
+# Strip leading/trailing whitespace (values pasted into the GitLab "Run
+# pipeline" form often carry some).
+trim() {
+  local s=${1-}
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+# All options below take a value; fail clearly if it is missing.
+need_val() { [[ $# -ge 2 ]] || die "Option $1 requires a value"; }
+
 # Revoke any active gcloud credentials and remove on-disk secrets.
 gcp_logout() {
   gcloud auth revoke --all --quiet >/dev/null 2>&1 || true
@@ -106,7 +118,7 @@ if not isinstance(projects, list):
     sys.stderr.write(f"ERROR: {path} must contain a top-level 'projects:' list.\n")
     sys.exit(2)
 
-rows, bad = [], 0
+rows, bad, seen = [], 0, set()
 for idx, entry in enumerate(projects, 1):
     if not isinstance(entry, dict):
         sys.stderr.write(f"WARN: entry #{idx} is not a mapping; skipping.\n")
@@ -132,6 +144,13 @@ for idx, entry in enumerate(projects, 1):
         )
         bad += 1
         continue
+    if pid in seen:
+        sys.stderr.write(
+            f"WARN: duplicate project_id '{pid}' (entry #{idx}); keeping the first entry.\n"
+        )
+        bad += 1
+        continue
+    seen.add(pid)
     rows.append("\t".join([pid, prov, sa, tok, loc]))
 
 sys.stdout.write("\n".join(rows) + ("\n" if rows else ""))
@@ -187,15 +206,20 @@ append_csv() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --config)    CONFIG_FILE="$2"; shift 2 ;;
-    --output)    FINAL_CSV="$2"; shift 2 ;;
-    --inventory) INVENTORY_SH="$2"; shift 2 ;;
-    --project)   PROJECT_FILTER="$2"; shift 2 ;;
-    --composer)  COMPOSER_FILTER="$2"; shift 2 ;;
+    --config)    need_val "$@"; CONFIG_FILE="$2"; shift 2 ;;
+    --output)    need_val "$@"; FINAL_CSV="$2"; shift 2 ;;
+    --inventory) need_val "$@"; INVENTORY_SH="$2"; shift 2 ;;
+    --project)   need_val "$@"; PROJECT_FILTER="$2"; shift 2 ;;
+    --composer)  need_val "$@"; COMPOSER_FILTER="$2"; shift 2 ;;
     -h|--help)   usage; exit 0 ;;
     *)           die "Unknown argument: $1" ;;
   esac
 done
+
+# Trim so exact-match filtering works even with stray whitespace from the
+# GitLab form; an all-whitespace value degrades to "no filter", same as blank.
+PROJECT_FILTER="$(trim "$PROJECT_FILTER")"
+COMPOSER_FILTER="$(trim "$COMPOSER_FILTER")"
 
 # ---------------------------------------------------------------------------
 # Main
@@ -213,7 +237,9 @@ main() {
   fi
 
   local targets
-  targets="$(parse_targets "$CONFIG_FILE")" || die "Could not read ${CONFIG_FILE}"
+  # tr guards against CRLF from a Windows python3 tainting the last TSV field
+  # (pipefail makes a parse_targets failure still fail the pipeline).
+  targets="$(parse_targets "$CONFIG_FILE" | tr -d '\r')" || die "Could not read ${CONFIG_FILE}"
   [[ -n "$targets" ]] || die "No usable project entries in ${CONFIG_FILE}"
 
   # Narrow to a single project when requested. Its WIF details still come from
@@ -223,7 +249,7 @@ main() {
     filtered="$(awk -F'\t' -v p="$PROJECT_FILTER" '$1==p' <<<"$targets")"
     if [[ -z "$filtered" ]]; then
       log "ERROR: project '${PROJECT_FILTER}' is not defined in ${CONFIG_FILE}."
-      log "       Known projects: $(cut -f1 <<<"$targets" | paste -sd', ' -)"
+      log "       Known projects: $(cut -f1 <<<"$targets" | paste -sd, -)"
       die "Add it to ${CONFIG_FILE} (with its WIF details) and retry."
     fi
     targets="$filtered"

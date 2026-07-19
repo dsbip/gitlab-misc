@@ -52,6 +52,10 @@ Notes:
 - Only the selected project is authenticated; the others are never touched.
 - If the named instance doesn't exist, you get a warning and a header-only CSV
   (the run itself still succeeds).
+- Values are whitespace-trimmed, so stray spaces pasted into the form are
+  harmless; an all-whitespace value counts as blank.
+- Duplicate `project_id` entries in `projects.yml` are warned about and only the
+  first one is used.
 
 The same filters work on the command line:
 

@@ -88,6 +88,9 @@ log() { printf '%s\n' "$*" >&2; }
 
 die() { log "ERROR: $*"; exit 1; }
 
+# All options below take a value; fail clearly if it is missing.
+need_val() { [[ $# -ge 2 ]] || die "Option $1 requires a value"; }
+
 usage() {
   # Print the leading comment block as help text (minus the shebang line).
   grep '^#' "$0" | grep -v '^#!' | sed 's/^# \{0,1\}//'
@@ -142,11 +145,11 @@ parse_args() {
   OUTPUT_CSV="${OUTPUT_CSV:-composer_dags.csv}"
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --projects)  PROJECTS_ARG="$2"; shift 2 ;;
-      --locations) LOCATIONS_ARG="$2"; shift 2 ;;
-      --output)    OUTPUT_CSV="$2"; shift 2 ;;
+      --projects)  need_val "$@"; PROJECTS_ARG="$2"; shift 2 ;;
+      --locations) need_val "$@"; LOCATIONS_ARG="$2"; shift 2 ;;
+      --output)    need_val "$@"; OUTPUT_CSV="$2"; shift 2 ;;
       --environment|--composer)
-                   ENV_FILTER="$2"; shift 2 ;;
+                   need_val "$@"; ENV_FILTER="$2"; shift 2 ;;
       -h|--help)   usage; exit 0 ;;
       -*)          die "Unknown option: $1" ;;
       *)
@@ -237,6 +240,13 @@ main() {
 
   if [[ ${#PROJECTS[@]} -eq 0 ]]; then
     die "No project specified. Pass a project id, --projects / GCP_PROJECTS, or set a gcloud default project."
+  fi
+
+  # A whitespace/comma-only --locations value would otherwise resolve to an
+  # empty list and silently scan zero environments; fall back to the default.
+  if [[ ${#LOCATIONS[@]} -eq 0 ]]; then
+    log "WARN: --locations / COMPOSER_LOCATIONS resolved to nothing; using ${DEFAULT_LOCATION}."
+    LOCATIONS=("$DEFAULT_LOCATION")
   fi
 
   refresh_token || die "Could not obtain an access token via 'gcloud auth print-access-token'. Authenticate first (e.g. gcloud auth activate-service-account / gcloud auth login)."
