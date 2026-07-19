@@ -20,19 +20,33 @@
 # while still publishing the rows that were collected.
 #
 # Config (flags override env vars):
-#   --config     / TARGETS_FILE   YAML config. Default: single-run/projects.yml
-#   --output     / OUTPUT_CSV     Combined CSV. Default: composer_dags_all_projects.csv
-#   --inventory  / INVENTORY_SH   Inventory script. Default: composer-dag-inventory/list_composer_dags.sh
+#   --config     / TARGETS_FILE       YAML config. Default: single-run/projects.yml
+#   --output     / OUTPUT_CSV         Combined CSV. Default: composer_dags_all_projects.csv
+#   --inventory  / INVENTORY_SH       Inventory script. Default: composer-dag-inventory/list_composer_dags.sh
+#   --project    / PROJECT_ID         Optional. Only inventory this project (it must
+#                                     still be listed in the YAML config, since that is
+#                                     where its WIF details come from).
+#   --composer   / COMPOSER_INSTANCE  Optional. Only inventory this Composer environment.
+#                                     Requires --project / PROJECT_ID.
+#
+# Scope selection:
+#   neither set          -> every project in the YAML config, all environments
+#   --project only       -> that project, ALL of its Composer environments
+#   --project + --composer -> that project, ONLY that Composer environment
 #
 # Usage:
 #   single-run/run_multi_project_inventory.sh
-#   single-run/run_multi_project_inventory.sh --config single-run/projects.yml --output all.csv
+#   single-run/run_multi_project_inventory.sh --project composer-project-a
+#   single-run/run_multi_project_inventory.sh --project composer-project-a --composer my-env
 
 set -uo pipefail
 
 CONFIG_FILE="${TARGETS_FILE:-single-run/projects.yml}"
 FINAL_CSV="${OUTPUT_CSV:-composer_dags_all_projects.csv}"
 INVENTORY_SH="${INVENTORY_SH:-composer-dag-inventory/list_composer_dags.sh}"
+# Optional runtime scope filters (set by CI pipeline variables).
+PROJECT_FILTER="${PROJECT_ID:-}"
+COMPOSER_FILTER="${COMPOSER_INSTANCE:-}"
 
 WORKDIR=""
 HEADER_WRITTEN=0
@@ -176,6 +190,8 @@ while [[ $# -gt 0 ]]; do
     --config)    CONFIG_FILE="$2"; shift 2 ;;
     --output)    FINAL_CSV="$2"; shift 2 ;;
     --inventory) INVENTORY_SH="$2"; shift 2 ;;
+    --project)   PROJECT_FILTER="$2"; shift 2 ;;
+    --composer)  COMPOSER_FILTER="$2"; shift 2 ;;
     -h|--help)   usage; exit 0 ;;
     *)           die "Unknown argument: $1" ;;
   esac
@@ -191,9 +207,27 @@ main() {
   [[ -f "$CONFIG_FILE" ]] || die "Config file not found: ${CONFIG_FILE}"
   [[ -x "$INVENTORY_SH" || -f "$INVENTORY_SH" ]] || die "Inventory script not found: ${INVENTORY_SH}"
 
+  # A Composer instance only makes sense within a single project.
+  if [[ -n "$COMPOSER_FILTER" && -z "$PROJECT_FILTER" ]]; then
+    die "COMPOSER_INSTANCE/--composer requires PROJECT_ID/--project to be set too."
+  fi
+
   local targets
   targets="$(parse_targets "$CONFIG_FILE")" || die "Could not read ${CONFIG_FILE}"
   [[ -n "$targets" ]] || die "No usable project entries in ${CONFIG_FILE}"
+
+  # Narrow to a single project when requested. Its WIF details still come from
+  # the YAML config, so the project must be listed there.
+  if [[ -n "$PROJECT_FILTER" ]]; then
+    local filtered
+    filtered="$(awk -F'\t' -v p="$PROJECT_FILTER" '$1==p' <<<"$targets")"
+    if [[ -z "$filtered" ]]; then
+      log "ERROR: project '${PROJECT_FILTER}' is not defined in ${CONFIG_FILE}."
+      log "       Known projects: $(cut -f1 <<<"$targets" | paste -sd', ' -)"
+      die "Add it to ${CONFIG_FILE} (with its WIF details) and retry."
+    fi
+    targets="$filtered"
+  fi
 
   WORKDIR="$(mktemp -d)"
   trap cleanup EXIT
@@ -201,6 +235,11 @@ main() {
   log "Config   : ${CONFIG_FILE}"
   log "Inventory: ${INVENTORY_SH}"
   log "Output   : ${FINAL_CSV}"
+  if [[ -n "$PROJECT_FILTER" ]]; then
+    log "Scope    : project ${PROJECT_FILTER}${COMPOSER_FILTER:+, Composer instance ${COMPOSER_FILTER}}"
+  else
+    log "Scope    : all projects in ${CONFIG_FILE}"
+  fi
   log ""
 
   local project_id provider service_account token_var location token tmp_csv
@@ -227,6 +266,7 @@ main() {
     tmp_csv="$WORKDIR/out_${project_id}.csv"
     local -a inv_args=("$project_id" --output "$tmp_csv")
     [[ -n "$location" ]] && inv_args+=(--locations "$location")
+    [[ -n "$COMPOSER_FILTER" ]] && inv_args+=(--environment "$COMPOSER_FILTER")
 
     if bash "$INVENTORY_SH" "${inv_args[@]}"; then
       if append_csv "$tmp_csv"; then

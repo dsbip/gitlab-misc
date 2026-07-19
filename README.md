@@ -96,6 +96,13 @@ The project id can be passed positionally (as above) or via `--projects` /
 defaults to **`europe-west2`** — override with `--locations` /
 `COMPOSER_LOCATIONS` (comma-separated). `OUTPUT_CSV` is also honored.
 
+To restrict the run to a single Composer environment, pass `--environment`
+(alias `--composer`); by default every RUNNING environment is inventoried:
+
+```bash
+composer-dag-inventory/list_composer_dags.sh my-gcp-project --environment my-composer-env
+```
+
 ### Run in GitLab CI
 
 1. In **Settings → CI/CD → Variables**, add:

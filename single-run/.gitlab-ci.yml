@@ -40,6 +40,22 @@
 stages:
   - inventory
 
+# ---------------------------------------------------------------------------
+# Runtime parameters (prefilled on the "Run pipeline" form)
+# ---------------------------------------------------------------------------
+# Leave both blank to inventory every project in projects.yml.
+#   PROJECT_ID only              -> that project, ALL of its Composer instances
+#   PROJECT_ID + COMPOSER_INSTANCE -> that project, ONLY that Composer instance
+# PROJECT_ID must still be listed in projects.yml (that is where its WIF
+# provider/service account come from).
+variables:
+  PROJECT_ID:
+    value: ""
+    description: "Optional. Inventory only this GCP project (must exist in single-run/projects.yml). Blank = all projects."
+  COMPOSER_INSTANCE:
+    value: ""
+    description: "Optional. Inventory only this Composer environment name. Requires PROJECT_ID."
+
 composer-dag-inventory-all-projects:
   stage: inventory
   image: google/cloud-sdk:slim
@@ -61,6 +77,8 @@ composer-dag-inventory-all-projects:
     - apt-get update -qq && apt-get install -y -qq jq curl python3-yaml >/dev/null
     - chmod +x single-run/run_multi_project_inventory.sh composer-dag-inventory/list_composer_dags.sh
 
+  # PROJECT_ID / COMPOSER_INSTANCE are picked up from the environment by the
+  # runner, so a blank value simply means "no filter".
   script:
     - single-run/run_multi_project_inventory.sh
         --config "$TARGETS_FILE"

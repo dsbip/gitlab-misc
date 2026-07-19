@@ -20,9 +20,12 @@
 #   <project> (positional) / GCP_PROJECTS   Project id(s) to scan. Default: active gcloud project.
 #   --locations / COMPOSER_LOCATIONS        Comma-separated regions. Default: europe-west2.
 #   --output    / OUTPUT_CSV                 Output path. Default: composer_dags.csv
+#   --environment (alias --composer)         Only inventory this one Composer
+#                                            environment. Default: all RUNNING ones.
 #
 # Usage:
 #   ./list_composer_dags.sh my-project-id
+#   ./list_composer_dags.sh my-project-id --environment my-composer-env
 #   ./list_composer_dags.sh --projects proj-a,proj-b --locations europe-west2 --output out.csv
 
 set -uo pipefail
@@ -73,6 +76,7 @@ def sched:
 PROJECTS_ARG=""
 LOCATIONS_ARG=""
 OUTPUT_CSV=""
+ENV_FILTER=""
 TOKEN=""
 TMP_BODY=""
 
@@ -141,6 +145,8 @@ parse_args() {
       --projects)  PROJECTS_ARG="$2"; shift 2 ;;
       --locations) LOCATIONS_ARG="$2"; shift 2 ;;
       --output)    OUTPUT_CSV="$2"; shift 2 ;;
+      --environment|--composer)
+                   ENV_FILTER="$2"; shift 2 ;;
       -h|--help)   usage; exit 0 ;;
       -*)          die "Unknown option: $1" ;;
       *)
@@ -240,6 +246,7 @@ main() {
 
   log "Projects : ${PROJECTS[*]}"
   log "Locations: ${LOCATIONS[*]}"
+  [[ -n "$ENV_FILTER" ]] && log "Composer : ${ENV_FILTER} (only)"
   log "Output   : ${OUTPUT_CSV}"
 
   printf '%s\n' "$CSV_HEADER" >"$OUTPUT_CSV"
@@ -249,6 +256,10 @@ main() {
     for location in "${LOCATIONS[@]}"; do
       while IFS=$'\t' read -r env_name state airflow_uri; do
         [[ -z "$env_name" ]] && continue
+        # Restrict to a single Composer environment when --environment is given.
+        if [[ -n "$ENV_FILTER" && "$env_name" != "$ENV_FILTER" ]]; then
+          continue
+        fi
         if [[ "$state" != "RUNNING" ]]; then
           log "Environment ${project}/${env_name} @ ${location} state=${state}; skipping"
           continue
@@ -270,6 +281,9 @@ main() {
   done
 
   log ""
+  if [[ -n "$ENV_FILTER" && "$total_envs" -eq 0 ]]; then
+    log "WARN: no RUNNING environment named '${ENV_FILTER}' found in ${PROJECTS[*]} @ ${LOCATIONS[*]}."
+  fi
   log "Done: scanned ${total_envs} running environment(s)."
   log "CSV written to ${OUTPUT_CSV}"
 }

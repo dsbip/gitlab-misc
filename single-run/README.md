@@ -31,6 +31,41 @@ A failure in one project is logged and skipped — the remaining projects still
 run. The job exits non-zero if **any** project failed, but the artifact is still
 published (`when: always`), so you get partial results plus a visible failure.
 
+## Narrowing the run at runtime
+
+Two optional pipeline variables (prefilled on GitLab's **Run pipeline** form)
+scope a single run. Leave both blank for the full sweep.
+
+| `PROJECT_ID` | `COMPOSER_INSTANCE` | What runs |
+| --- | --- | --- |
+| *(blank)* | *(blank)* | Every project in `projects.yml`, all Composer instances |
+| `my-proj` | *(blank)* | **Only `my-proj`**, all of its Composer instances |
+| `my-proj` | `my-env` | **Only `my-env`** inside `my-proj` |
+
+Notes:
+
+- `PROJECT_ID` must still be listed in `projects.yml` — that's where its WIF
+  provider and service account come from. An unknown id fails fast and prints
+  the known project ids.
+- `COMPOSER_INSTANCE` without `PROJECT_ID` is rejected (an instance name is only
+  meaningful within one project).
+- Only the selected project is authenticated; the others are never touched.
+- If the named instance doesn't exist, you get a warning and a header-only CSV
+  (the run itself still succeeds).
+
+The same filters work on the command line:
+
+```bash
+single-run/run_multi_project_inventory.sh --project my-proj
+single-run/run_multi_project_inventory.sh --project my-proj --composer my-env
+```
+
+and directly on the inventory script:
+
+```bash
+composer-dag-inventory/list_composer_dags.sh my-proj --environment my-env
+```
+
 ## Wiring it up
 
 ### 1. Point GitLab at this config
