@@ -1,0 +1,84 @@
+# GitLab CI: inventory Cloud Composer DAGs across MULTIPLE GCP projects in a
+# single job, authenticating to each project with Workload Identity Federation
+# (WIF) and revoking the credentials before moving to the next one.
+#
+# All results are appended into ONE combined CSV artifact.
+#
+# ---------------------------------------------------------------------------
+# How to use this file
+# ---------------------------------------------------------------------------
+# GitLab reads one CI config per project. Either:
+#   a) Settings > CI/CD > General pipelines > "CI/CD configuration file" ->
+#      single-run/.gitlab-ci.yml
+#   b) or add to the root .gitlab-ci.yml:
+#        include:
+#          - local: single-run/.gitlab-ci.yml
+#
+# ---------------------------------------------------------------------------
+# Configuring projects
+# ---------------------------------------------------------------------------
+# Projects + WIF details live in single-run/projects.yml (a YAML array).
+# Each entry names the id_token variable holding its OIDC token (id_token_var).
+#
+# GitLab CANNOT create id_tokens dynamically inside a loop - the `aud` is
+# resolved when the pipeline is created. So every distinct `id_token_var` used
+# in projects.yml MUST be declared under `id_tokens:` below, with an `aud` that
+# the corresponding WIF provider accepts.
+#
+#   * Projects sharing ONE WIF provider  -> omit id_token_var in projects.yml
+#     (defaults to GCP_ID_TOKEN) and declare only GCP_ID_TOKEN here.
+#   * Projects with DIFFERENT providers  -> one id_tokens entry each.
+#
+# The `aud` must match what the WIF provider was configured to allow. The
+# conventional value is the provider resource prefixed with the IAM host:
+#   https://iam.googleapis.com/projects/<NUMBER>/locations/global/workloadIdentityPools/<POOL>/providers/<PROVIDER>
+#
+# Each project's service account needs roles/composer.user, and its WIF provider
+# must trust this GitLab project (attribute condition on e.g.
+# assertion.project_path == "group/repo").
+
+stages:
+  - inventory
+
+composer-dag-inventory-all-projects:
+  stage: inventory
+  image: google/cloud-sdk:slim
+
+  # One entry per distinct WIF provider referenced by projects.yml.
+  # The names here must match `id_token_var` values in projects.yml.
+  id_tokens:
+    GCP_ID_TOKEN_A:
+      aud: https://iam.googleapis.com/projects/111111111111/locations/global/workloadIdentityPools/gitlab-pool/providers/gitlab
+    GCP_ID_TOKEN_B:
+      aud: https://iam.googleapis.com/projects/222222222222/locations/global/workloadIdentityPools/gitlab-pool/providers/gitlab
+
+  variables:
+    TARGETS_FILE: "single-run/projects.yml"
+    OUTPUT_CSV: "composer_dags_all_projects.csv"
+
+  before_script:
+    # jq + curl: used by the inventory script. python3-yaml: reads projects.yml.
+    - apt-get update -qq && apt-get install -y -qq jq curl python3-yaml >/dev/null
+    - chmod +x single-run/run_multi_project_inventory.sh composer-dag-inventory/list_composer_dags.sh
+
+  script:
+    - single-run/run_multi_project_inventory.sh
+        --config "$TARGETS_FILE"
+        --output "$OUTPUT_CSV"
+        --inventory composer-dag-inventory/list_composer_dags.sh
+
+  artifacts:
+    name: "composer-dags-all-projects-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - composer_dags_all_projects.csv
+    expire_in: 30 days
+    # Publish the CSV even if some projects failed.
+    when: always
+
+  rules:
+    # Run automatically for scheduled pipelines...
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: always
+    # ...and offer a manual "play" button everywhere else.
+    - when: manual
+      allow_failure: true
