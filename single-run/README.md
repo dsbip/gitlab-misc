@@ -8,7 +8,8 @@ credentials, and appends every project's rows into **one combined CSV artifact**
 | --- | --- |
 | [`.gitlab-ci.yml`](.gitlab-ci.yml) | The pipeline job (`id_tokens`, artifact, deps). |
 | [`projects.yml`](projects.yml) | YAML array of projects + WIF connection details. |
-| [`run_multi_project_inventory.sh`](run_multi_project_inventory.sh) | The loop: auth → inventory → append → revoke. |
+| [`run_multi_project_inventory.sh`](run_multi_project_inventory.sh) | The loop: auth → inventory → append → revoke. Needs `python3` + PyYAML for the config. |
+| [`run_multi_project_inventory_v2.sh`](run_multi_project_inventory_v2.sh) | Drop-in replacement that does **not** require Python: uses python3 + PyYAML when present, otherwise a built-in pure-shell YAML parser. |
 
 It reuses [`../composer-dag-inventory/list_composer_dags.sh`](../composer-dag-inventory/list_composer_dags.sh)
 to do the actual DAG listing, so the CSV columns stay identical:
@@ -162,3 +163,14 @@ single-run/run_multi_project_inventory.sh \
 Paths default to repo-root-relative, matching how CI invokes it. Requires
 `gcloud`, `python3` + PyYAML (to read the config), plus `jq` and `curl` for the
 inventory script itself.
+
+## Runner image without Python?
+
+Use [`run_multi_project_inventory_v2.sh`](run_multi_project_inventory_v2.sh) —
+same flags, variables and behavior. It parses `projects.yml` with python3 +
+PyYAML when available and otherwise falls back to a built-in pure-shell parser
+(a `NOTE:` line in the job log tells you which one ran). The fallback supports
+the documented layout — block-style entries, `- {k: v, …}` one-liners,
+comments, quoted values, CRLF files — but is not a general YAML parser:
+anchors, multi-line values and nested structures still need PyYAML. To switch
+CI over, point the job's `script:` at the v2 file.
