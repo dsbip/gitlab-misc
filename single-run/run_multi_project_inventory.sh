@@ -7,8 +7,11 @@
 # Rows from every project are appended into a single combined CSV (the header is
 # written once, taken from the inventory script's own output so it stays in sync).
 #
-# Per project the sequence is:
-#   1. Resolve the GitLab OIDC id_token for that project (id_token_var).
+# The YAML config stores NO WIF values - only the NAMES of the GitLab CI/CD
+# variables that hold them (wif_provider_url_var / wif_service_account_var /
+# id_token_var). Per project the sequence is:
+#   1. Resolve the WIF provider URL, service account and OIDC id_token from the
+#      CI/CD variables named by the YAML entry (indirect expansion).
 #   2. gcloud iam workload-identity-pools create-cred-config  -> external account config
 #   3. gcloud auth login --cred-file=...                      -> authenticate
 #   4. composer-dag-inventory/list_composer_dags.sh <project> -> inventory to a temp CSV
@@ -90,8 +93,9 @@ cleanup() {
   [[ -n "$WORKDIR" ]] && rm -rf "$WORKDIR" 2>/dev/null || true
 }
 
-# Emit one TSV line per project: project_id, provider, service_account,
-# id_token_var, location. Invalid/incomplete entries are reported and skipped.
+# Emit one TSV line per project: project_id, provider_url_var, service_account_var,
+# id_token_var, location. The *_var fields are NAMES of CI/CD variables (resolved
+# later by the loop); invalid/incomplete entries are reported and skipped.
 parse_targets() {
   python3 - "$1" <<'PY'
 import sys
@@ -125,22 +129,19 @@ for idx, entry in enumerate(projects, 1):
         bad += 1
         continue
     pid = str(entry.get("project_id") or "").strip()
-    prov = str(entry.get("wif_provider_url") or "").strip()
-    sa = str(entry.get("wif_service_account") or "").strip()
+    prov_var = str(entry.get("wif_provider_url_var") or "WIF_PROVIDER_URL").strip()
+    sa_var = str(entry.get("wif_service_account_var") or "WIF_SERVICE_ACCOUNT").strip()
     tok = str(entry.get("id_token_var") or "GCP_ID_TOKEN").strip()
     loc = str(entry.get("location") or "").strip()
-    missing = [
-        k
-        for k, v in (
-            ("project_id", pid),
-            ("wif_provider_url", prov),
-            ("wif_service_account", sa),
-        )
-        if not v
-    ]
-    if missing:
+    if not pid:
+        sys.stderr.write(f"WARN: entry #{idx} missing project_id; skipping.\n")
+        bad += 1
+        continue
+    if entry.get("wif_provider_url") or entry.get("wif_service_account"):
         sys.stderr.write(
-            f"WARN: entry #{idx} ({pid or 'unnamed'}) missing {', '.join(missing)}; skipping.\n"
+            f"WARN: entry #{idx} ({pid}) uses the removed literal wif_provider_url/"
+            "wif_service_account fields; use wif_provider_url_var / "
+            "wif_service_account_var naming CI/CD variables instead. Skipping.\n"
         )
         bad += 1
         continue
@@ -151,7 +152,7 @@ for idx, entry in enumerate(projects, 1):
         bad += 1
         continue
     seen.add(pid)
-    rows.append("\t".join([pid, prov, sa, tok, loc]))
+    rows.append("\t".join([pid, prov_var, sa_var, tok, loc]))
 
 sys.stdout.write("\n".join(rows) + ("\n" if rows else ""))
 sys.exit(0)
@@ -268,19 +269,36 @@ main() {
   fi
   log ""
 
-  local project_id provider service_account token_var location token tmp_csv
-  while IFS=$'\t' read -r project_id provider service_account token_var location; do
+  local project_id provider_var sa_var token_var location tmp_csv
+  local provider service_account token
+  while IFS=$'\t' read -r project_id provider_var sa_var token_var location; do
     [[ -z "$project_id" ]] && continue
-    log "=== ${project_id} (SA: ${service_account}) ==="
+    log "=== ${project_id} ==="
 
-    # Resolve the GitLab id_token by variable name (indirect expansion).
+    # Resolve WIF details + OIDC token from the CI/CD variables named by the
+    # YAML entry (indirect expansion). Values live only in GitLab, not in git.
+    provider="$(trim "${!provider_var-}")"
+    service_account="$(trim "${!sa_var-}")"
     token="${!token_var-}"
+    if [[ -z "$provider" ]]; then
+      log "  ERROR: WIF provider variable '${provider_var}' is empty/unset."
+      log "         Define it in Settings > CI/CD > Variables (value: projects/<NUM>/locations/global/workloadIdentityPools/<POOL>/providers/<PROVIDER>)."
+      FAIL_COUNT=$((FAIL_COUNT + 1))
+      continue
+    fi
+    if [[ -z "$service_account" ]]; then
+      log "  ERROR: WIF service-account variable '${sa_var}' is empty/unset."
+      log "         Define it in Settings > CI/CD > Variables (value: the service account to impersonate)."
+      FAIL_COUNT=$((FAIL_COUNT + 1))
+      continue
+    fi
     if [[ -z "$token" ]]; then
       log "  ERROR: id_token variable '${token_var}' is empty/unset."
       log "         Declare it under 'id_tokens:' in .gitlab-ci.yml with an aud matching ${provider}."
       FAIL_COUNT=$((FAIL_COUNT + 1))
       continue
     fi
+    log "  WIF: ${service_account} via ${provider_var}"
 
     if ! gcp_login_wif "$project_id" "$provider" "$service_account" "$token"; then
       FAIL_COUNT=$((FAIL_COUNT + 1))

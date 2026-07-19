@@ -17,8 +17,18 @@
 # ---------------------------------------------------------------------------
 # Configuring projects
 # ---------------------------------------------------------------------------
-# Projects + WIF details live in single-run/projects.yml (a YAML array).
-# Each entry names the id_token variable holding its OIDC token (id_token_var).
+# single-run/projects.yml lists the projects, but holds NO WIF values - each
+# entry only NAMES the CI/CD variables to read. The actual values live in
+# Settings > CI/CD > Variables:
+#
+#   WIF_PROVIDER_URL_A    -> projects/<NUMBER>/locations/global/workloadIdentityPools/<POOL>/providers/<PROVIDER>
+#                            (the provider resource path, no https:// scheme)
+#   WIF_SERVICE_ACCOUNT_A -> composer-inventory@composer-project-a.iam.gserviceaccount.com
+#   WIF_PROVIDER_URL_B / WIF_SERVICE_ACCOUNT_B -> same for project B, etc.
+#
+# Entries that omit wif_provider_url_var / wif_service_account_var default to
+# the variables WIF_PROVIDER_URL / WIF_SERVICE_ACCOUNT, so a fleet sharing one
+# provider+SA defines just those two.
 #
 # GitLab CANNOT create id_tokens dynamically inside a loop - the `aud` is
 # resolved when the pipeline is created. So every distinct `id_token_var` used
@@ -29,9 +39,9 @@
 #     (defaults to GCP_ID_TOKEN) and declare only GCP_ID_TOKEN here.
 #   * Projects with DIFFERENT providers  -> one id_tokens entry each.
 #
-# The `aud` must match what the WIF provider was configured to allow. The
-# conventional value is the provider resource prefixed with the IAM host:
-#   https://iam.googleapis.com/projects/<NUMBER>/locations/global/workloadIdentityPools/<POOL>/providers/<PROVIDER>
+# The `aud` below references the same WIF_PROVIDER_URL_* variables (supported
+# in GitLab 16.1+; on older GitLab, hardcode the full
+# https://iam.googleapis.com/projects/... value instead).
 #
 # Each project's service account needs roles/composer.user, and its WIF provider
 # must trust this GitLab project (attribute condition on e.g.
@@ -61,12 +71,14 @@ composer-dag-inventory-all-projects:
   image: google/cloud-sdk:slim
 
   # One entry per distinct WIF provider referenced by projects.yml.
-  # The names here must match `id_token_var` values in projects.yml.
+  # The names here must match `id_token_var` values in projects.yml; the auds
+  # reuse the WIF_PROVIDER_URL_* CI/CD variables (GitLab 16.1+ expands
+  # variables in aud - hardcode the full URL on older versions).
   id_tokens:
     GCP_ID_TOKEN_A:
-      aud: https://iam.googleapis.com/projects/111111111111/locations/global/workloadIdentityPools/gitlab-pool/providers/gitlab
+      aud: https://iam.googleapis.com/${WIF_PROVIDER_URL_A}
     GCP_ID_TOKEN_B:
-      aud: https://iam.googleapis.com/projects/222222222222/locations/global/workloadIdentityPools/gitlab-pool/providers/gitlab
+      aud: https://iam.googleapis.com/${WIF_PROVIDER_URL_B}
 
   variables:
     TARGETS_FILE: "single-run/projects.yml"

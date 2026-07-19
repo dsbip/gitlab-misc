@@ -1,39 +1,43 @@
-# Composer projects to inventory, with their Workload Identity Federation (WIF)
-# connection details. The pipeline loops over this array, authenticates to each
-# project with WIF, runs the DAG inventory, then revokes the credentials.
+# Composer projects to inventory.
+#
+# WIF connection details are NOT stored in this file. The provider URL and
+# service account live in GitLab CI/CD variables (Settings > CI/CD > Variables);
+# each entry here only names WHICH variables to read at runtime.
 #
 # Fields per entry:
-#   project_id           (required) GCP project id holding the Composer environments.
-#   wif_provider_url     (required) Full WIF provider resource name, WITHOUT a scheme:
-#                          projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/<POOL>/providers/<PROVIDER>
-#                        This is passed to `gcloud iam workload-identity-pools create-cred-config`.
-#   wif_service_account  (required) Service account to impersonate, e.g.
-#                          composer-inventory@<project>.iam.gserviceaccount.com
-#   id_token_var         (optional) Name of the GitLab id_token CI variable holding the
-#                        OIDC token whose `aud` matches this provider.
-#                        Defaults to GCP_ID_TOKEN.
-#                        IMPORTANT: every distinct value used here must also be declared
-#                        under `id_tokens:` in .gitlab-ci.yml (GitLab cannot create
-#                        id_tokens dynamically in a loop).
-#   location             (optional) Composer region. Defaults to the inventory
-#                        script's default (europe-west2).
+#   project_id               (required) GCP project id holding the Composer environments.
+#   wif_provider_url_var     (optional) Name of the CI/CD variable holding the WIF
+#                            provider resource path, WITHOUT a scheme:
+#                              projects/<NUMBER>/locations/global/workloadIdentityPools/<POOL>/providers/<PROVIDER>
+#                            Default: WIF_PROVIDER_URL.
+#   wif_service_account_var  (optional) Name of the CI/CD variable holding the service
+#                            account to impersonate, e.g.
+#                              composer-inventory@<project>.iam.gserviceaccount.com
+#                            Default: WIF_SERVICE_ACCOUNT.
+#   id_token_var             (optional) Name of the GitLab id_token CI variable holding
+#                            the OIDC token whose `aud` matches this provider.
+#                            Default: GCP_ID_TOKEN.
+#                            IMPORTANT: every distinct value used here must also be
+#                            declared under `id_tokens:` in .gitlab-ci.yml (GitLab
+#                            cannot create id_tokens dynamically in a loop).
+#   location                 (optional) Composer region. Defaults to the inventory
+#                            script's default (europe-west2).
 
 projects:
   - project_id: composer-project-a
-    wif_provider_url: projects/111111111111/locations/global/workloadIdentityPools/gitlab-pool/providers/gitlab
-    wif_service_account: composer-inventory@composer-project-a.iam.gserviceaccount.com
+    wif_provider_url_var: WIF_PROVIDER_URL_A
+    wif_service_account_var: WIF_SERVICE_ACCOUNT_A
     id_token_var: GCP_ID_TOKEN_A
     location: europe-west2
 
   - project_id: composer-project-b
-    wif_provider_url: projects/222222222222/locations/global/workloadIdentityPools/gitlab-pool/providers/gitlab
-    wif_service_account: composer-inventory@composer-project-b.iam.gserviceaccount.com
+    wif_provider_url_var: WIF_PROVIDER_URL_B
+    wif_service_account_var: WIF_SERVICE_ACCOUNT_B
     id_token_var: GCP_ID_TOKEN_B
     location: europe-west2
 
-  # Projects that share ONE WIF provider can share a single id_token: omit
-  # id_token_var (defaults to GCP_ID_TOKEN) and declare only that one in CI.
+  # Projects that share ONE WIF provider + service account can omit the *_var
+  # fields entirely - they default to WIF_PROVIDER_URL / WIF_SERVICE_ACCOUNT /
+  # GCP_ID_TOKEN, so you define those three once.
   # - project_id: composer-project-c
-  #   wif_provider_url: projects/333333333333/locations/global/workloadIdentityPools/gitlab-pool/providers/gitlab
-  #   wif_service_account: composer-inventory@composer-project-c.iam.gserviceaccount.com
   #   location: europe-west2
