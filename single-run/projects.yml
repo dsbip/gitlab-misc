@@ -14,30 +14,27 @@
 #                            account to impersonate, e.g.
 #                              composer-inventory@<project>.iam.gserviceaccount.com
 #                            Default: WIF_SERVICE_ACCOUNT.
-#   id_token_var             (optional) Name of the GitLab id_token CI variable holding
-#                            the OIDC token whose `aud` matches this provider.
-#                            Default: GCP_ID_TOKEN.
-#                            IMPORTANT: every distinct value used here must also be
-#                            declared under `id_tokens:` in .gitlab-ci.yml (GitLab
-#                            cannot create id_tokens dynamically in a loop).
-#   location                 (optional) Composer region. Defaults to the inventory
-#                            script's default (europe-west2).
+#   location                 (optional) Composer region. Default: europe-west2.
+#
+# The OIDC id_token is NOT configured per project. The pipeline sets a single
+# ID_TOKEN_VAR environment variable (default: GCP_ID_TOKEN) naming the token
+# declared under `id_tokens:` in .gitlab-ci.yml, and every project uses it.
+# NOTE: a token carries exactly one `aud`, so every project's WIF provider must
+# be configured to accept that same audience.
 
 projects:
   - project_id: composer-project-a
     wif_provider_url_var: WIF_PROVIDER_URL_A
     wif_service_account_var: WIF_SERVICE_ACCOUNT_A
-    id_token_var: GCP_ID_TOKEN_A
-    location: europe-west2
 
   - project_id: composer-project-b
     wif_provider_url_var: WIF_PROVIDER_URL_B
     wif_service_account_var: WIF_SERVICE_ACCOUNT_B
-    id_token_var: GCP_ID_TOKEN_B
-    location: europe-west2
 
-  # Projects that share ONE WIF provider + service account can omit the *_var
-  # fields entirely - they default to WIF_PROVIDER_URL / WIF_SERVICE_ACCOUNT /
-  # GCP_ID_TOKEN, so you define those three once.
+  # Projects sharing ONE WIF provider + service account can omit both *_var
+  # fields - they default to WIF_PROVIDER_URL / WIF_SERVICE_ACCOUNT, so you
+  # define those two variables once.
+  #
+  # `location` is optional; omit it for europe-west2, or set it per project:
   # - project_id: composer-project-c
-  #   location: europe-west2
+  #   location: us-central1

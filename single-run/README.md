@@ -20,9 +20,10 @@ Composer,Project,DAG_Name,Dag_path,Active?,Scheduled,Scheduled Time
 
 ## Per-project sequence
 
-1. Resolve the project's WIF provider URL, service account and OIDC token from
-   the CI/CD variables named by its YAML entry (`wif_provider_url_var`,
-   `wif_service_account_var`, `id_token_var`) — no WIF values live in git.
+1. Resolve the project's WIF provider URL and service account from the CI/CD
+   variables named by its YAML entry (`wif_provider_url_var`,
+   `wif_service_account_var`) — no WIF values live in git. The OIDC token is
+   pipeline-wide, read from the variable named by `ID_TOKEN_VAR`.
 2. `gcloud iam workload-identity-pools create-cred-config` → external-account config.
 3. `gcloud auth login --cred-file=…` + `gcloud config set project`.
 4. Run the inventory script into a temp CSV.
@@ -97,9 +98,12 @@ projects:
   - project_id: composer-project-a
     wif_provider_url_var: WIF_PROVIDER_URL_A          # optional, defaults to WIF_PROVIDER_URL
     wif_service_account_var: WIF_SERVICE_ACCOUNT_A    # optional, defaults to WIF_SERVICE_ACCOUNT
-    id_token_var: GCP_ID_TOKEN_A                      # optional, defaults to GCP_ID_TOKEN
-    location: europe-west2                            # optional, defaults to europe-west2
+    # location: us-central1                           # optional, defaults to europe-west2
 ```
+
+`location` is optional — omit it and the project is scanned in
+**`europe-west2`**. The OIDC token is *not* configured here; it is
+pipeline-wide (see step 4).
 
 ### 3. Define the WIF values in CI/CD variables
 
@@ -109,33 +113,36 @@ In **Settings → CI/CD → Variables**, create the variables named above:
 | --- | --- |
 | `WIF_PROVIDER_URL_A` | `projects/<NUMBER>/locations/global/workloadIdentityPools/<POOL>/providers/<PROVIDER>` — the provider **resource name**, no scheme (exactly what `gcloud iam workload-identity-pools create-cred-config` expects). |
 | `WIF_SERVICE_ACCOUNT_A` | `composer-inventory@composer-project-a.iam.gserviceaccount.com` — the service account to impersonate. |
+| `WIF_AUDIENCE` | The audience for the shared OIDC token, conventionally `https://iam.googleapis.com/projects/<NUMBER>/locations/global/workloadIdentityPools/<POOL>/providers/<PROVIDER>`. |
 
 A fleet sharing one provider + service account can omit the `*_var` fields in
 `projects.yml` and define just `WIF_PROVIDER_URL` / `WIF_SERVICE_ACCOUNT` once.
 If a referenced variable is missing at runtime, that project fails with an
 error naming the variable; the other projects still run.
 
-### 4. Declare a matching `id_tokens` entry
+### 4. Declare the shared `id_tokens` entry
 
-> **This is the one manual step you cannot avoid.** GitLab resolves `id_tokens`
-> when the pipeline is *created*, so they cannot be generated inside a loop.
-> Every distinct `id_token_var` in `projects.yml` must be declared in
-> `.gitlab-ci.yml`:
+GitLab resolves `id_tokens` when the pipeline is *created*, so they cannot be
+generated inside a loop. One token is therefore declared for the whole
+pipeline, and `ID_TOKEN_VAR` tells the script which variable holds it:
 
 ```yaml
   id_tokens:
-    GCP_ID_TOKEN_A:
-      aud: https://iam.googleapis.com/${WIF_PROVIDER_URL_A}
+    GCP_ID_TOKEN:
+      aud: "$WIF_AUDIENCE"
+
+  variables:
+    ID_TOKEN_VAR: "GCP_ID_TOKEN"   # static; names the token above
 ```
 
-- Projects sharing **one** WIF provider → omit `id_token_var` (defaults to
-  `GCP_ID_TOKEN`) and declare only that single token.
-- Projects with **different** providers → one `id_tokens` entry each.
+> ⚠️ **A token carries exactly one `aud`.** Because every project shares this
+> token, **each project's WIF provider must be configured to accept
+> `WIF_AUDIENCE`** (set the provider's allowed audience to that value). If your
+> providers must use different audiences, they cannot share one token.
 
-The `aud` must be an audience the provider accepts (conventionally the provider
-resource prefixed with `https://iam.googleapis.com/`). GitLab 16.1+ expands
-CI/CD variables inside `aud` (as shown); on older versions hardcode the full
-value.
+`ID_TOKEN_VAR` defaults to `GCP_ID_TOKEN`, so you only need to set it if you
+name the token something else. GitLab 16.1+ expands CI/CD variables inside
+`aud` (as shown); on older versions hardcode the full value.
 
 ### 5. GCP side, per project
 
@@ -152,8 +159,9 @@ Export the same variables the CI job would provide:
 ```bash
 export WIF_PROVIDER_URL_A=projects/111111111111/locations/global/workloadIdentityPools/gitlab-pool/providers/gitlab
 export WIF_SERVICE_ACCOUNT_A=composer-inventory@composer-project-a.iam.gserviceaccount.com
-export GCP_ID_TOKEN_A=...                      # OIDC token for provider A
-# ...and the _B set, if scanning project B too
+export GCP_ID_TOKEN=...                        # the one shared OIDC token
+# export ID_TOKEN_VAR=GCP_ID_TOKEN             # only if you renamed the token
+# ...and the _B provider/SA pair, if scanning project B too
 single-run/run_multi_project_inventory.sh \
   --config single-run/projects.yml \
   --output composer_dags_all_projects.csv \

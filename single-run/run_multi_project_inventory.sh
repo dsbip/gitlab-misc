@@ -8,10 +8,16 @@
 # written once, taken from the inventory script's own output so it stays in sync).
 #
 # The YAML config stores NO WIF values - only the NAMES of the GitLab CI/CD
-# variables that hold them (wif_provider_url_var / wif_service_account_var /
-# id_token_var). Per project the sequence is:
-#   1. Resolve the WIF provider URL, service account and OIDC id_token from the
-#      CI/CD variables named by the YAML entry (indirect expansion).
+# variables that hold them (wif_provider_url_var / wif_service_account_var).
+#
+# The OIDC id_token is NOT per project: ID_TOKEN_VAR (an environment variable
+# set in .gitlab-ci.yml, default GCP_ID_TOKEN) names the single token used for
+# every project. A token carries one `aud`, so every project's WIF provider
+# must accept that audience.
+#
+# Per project the sequence is:
+#   1. Resolve the WIF provider URL and service account from the CI/CD
+#      variables named by the YAML entry (indirect expansion).
 #   2. gcloud iam workload-identity-pools create-cred-config  -> external account config
 #   3. gcloud auth login --cred-file=...                      -> authenticate
 #   4. composer-dag-inventory/list_composer_dags.sh <project> -> inventory to a temp CSV
@@ -31,6 +37,8 @@
 #                                     where its WIF details come from).
 #   --composer   / COMPOSER_INSTANCE  Optional. Only inventory this Composer environment.
 #                                     Requires --project / PROJECT_ID.
+#   ID_TOKEN_VAR (env only)           Name of the variable holding the GitLab OIDC
+#                                     id_token. Default: GCP_ID_TOKEN.
 #
 # Scope selection:
 #   neither set          -> every project in the YAML config, all environments
@@ -50,6 +58,11 @@ INVENTORY_SH="${INVENTORY_SH:-composer-dag-inventory/list_composer_dags.sh}"
 # Optional runtime scope filters (set by CI pipeline variables).
 PROJECT_FILTER="${PROJECT_ID:-}"
 COMPOSER_FILTER="${COMPOSER_INSTANCE:-}"
+# Single OIDC id_token shared by every project; the CI file sets ID_TOKEN_VAR.
+ID_TOKEN_VAR="${ID_TOKEN_VAR:-GCP_ID_TOKEN}"
+# Composer region used when an entry omits `location`.
+DEFAULT_LOCATION="europe-west2"
+CSV_HEADER="Composer,Project,DAG_Name,Dag_path,Active?,Scheduled,Scheduled Time"
 
 WORKDIR=""
 HEADER_WRITTEN=0
@@ -79,6 +92,9 @@ trim() {
 # All options below take a value; fail clearly if it is missing.
 need_val() { [[ $# -ge 2 ]] || die "Option $1 requires a value"; }
 
+# Guard indirect expansion: a bogus name would otherwise be a bash error.
+valid_var_name() { [[ "${1-}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; }
+
 # Revoke any active gcloud credentials and remove on-disk secrets.
 gcp_logout() {
   gcloud auth revoke --all --quiet >/dev/null 2>&1 || true
@@ -94,8 +110,8 @@ cleanup() {
 }
 
 # Emit one TSV line per project: project_id, provider_url_var, service_account_var,
-# id_token_var, location. The *_var fields are NAMES of CI/CD variables (resolved
-# later by the loop); invalid/incomplete entries are reported and skipped.
+# location. The *_var fields are NAMES of CI/CD variables (resolved later by the
+# loop); invalid/incomplete entries are reported and skipped.
 parse_targets() {
   python3 - "$1" <<'PY'
 import sys
@@ -131,7 +147,6 @@ for idx, entry in enumerate(projects, 1):
     pid = str(entry.get("project_id") or "").strip()
     prov_var = str(entry.get("wif_provider_url_var") or "WIF_PROVIDER_URL").strip()
     sa_var = str(entry.get("wif_service_account_var") or "WIF_SERVICE_ACCOUNT").strip()
-    tok = str(entry.get("id_token_var") or "GCP_ID_TOKEN").strip()
     loc = str(entry.get("location") or "").strip()
     if not pid:
         sys.stderr.write(f"WARN: entry #{idx} missing project_id; skipping.\n")
@@ -151,8 +166,13 @@ for idx, entry in enumerate(projects, 1):
         )
         bad += 1
         continue
+    if entry.get("id_token_var"):
+        sys.stderr.write(
+            f"WARN: entry #{idx} ({pid}) sets id_token_var, which is no longer used "
+            "per project; the pipeline-wide ID_TOKEN_VAR applies. Ignoring it.\n"
+        )
     seen.add(pid)
-    rows.append("\t".join([pid, prov_var, sa_var, tok, loc]))
+    rows.append("\t".join([pid, prov_var, sa_var, loc]))
 
 sys.stdout.write("\n".join(rows) + ("\n" if rows else ""))
 sys.exit(0)
@@ -237,6 +257,16 @@ main() {
     die "COMPOSER_INSTANCE/--composer requires PROJECT_ID/--project to be set too."
   fi
 
+  # One OIDC token for every project, named by ID_TOKEN_VAR. Resolve it up
+  # front: without it nothing can authenticate.
+  valid_var_name "$ID_TOKEN_VAR" || die "ID_TOKEN_VAR ('${ID_TOKEN_VAR}') is not a valid variable name."
+  local token="${!ID_TOKEN_VAR-}"
+  if [[ -z "$token" ]]; then
+    # Still emit the (empty) CSV so the CI artifact exists.
+    printf '%s\n' "$CSV_HEADER" >"$FINAL_CSV" 2>/dev/null || true
+    die "id_token variable '${ID_TOKEN_VAR}' is empty/unset. Declare it under 'id_tokens:' in .gitlab-ci.yml (and set ID_TOKEN_VAR if you renamed it)."
+  fi
+
   local targets
   # tr guards against CRLF from a Windows python3 tainting the last TSV field
   # (pipefail makes a parse_targets failure still fail the pipeline).
@@ -262,6 +292,7 @@ main() {
   log "Config   : ${CONFIG_FILE}"
   log "Inventory: ${INVENTORY_SH}"
   log "Output   : ${FINAL_CSV}"
+  log "id_token : ${ID_TOKEN_VAR}"
   if [[ -n "$PROJECT_FILTER" ]]; then
     log "Scope    : project ${PROJECT_FILTER}${COMPOSER_FILTER:+, Composer instance ${COMPOSER_FILTER}}"
   else
@@ -269,17 +300,21 @@ main() {
   fi
   log ""
 
-  local project_id provider_var sa_var token_var location tmp_csv
-  local provider service_account token
-  while IFS=$'\t' read -r project_id provider_var sa_var token_var location; do
+  local project_id provider_var sa_var location tmp_csv
+  local provider service_account
+  while IFS=$'\t' read -r project_id provider_var sa_var location; do
     [[ -z "$project_id" ]] && continue
     log "=== ${project_id} ==="
 
-    # Resolve WIF details + OIDC token from the CI/CD variables named by the
-    # YAML entry (indirect expansion). Values live only in GitLab, not in git.
+    # Resolve WIF details from the CI/CD variables named by the YAML entry
+    # (indirect expansion). Values live only in GitLab, not in git.
+    if ! valid_var_name "$provider_var" || ! valid_var_name "$sa_var"; then
+      log "  ERROR: invalid variable name in config ('${provider_var}' / '${sa_var}')."
+      FAIL_COUNT=$((FAIL_COUNT + 1))
+      continue
+    fi
     provider="$(trim "${!provider_var-}")"
     service_account="$(trim "${!sa_var-}")"
-    token="${!token_var-}"
     if [[ -z "$provider" ]]; then
       log "  ERROR: WIF provider variable '${provider_var}' is empty/unset."
       log "         Define it in Settings > CI/CD > Variables (value: projects/<NUM>/locations/global/workloadIdentityPools/<POOL>/providers/<PROVIDER>)."
@@ -292,13 +327,10 @@ main() {
       FAIL_COUNT=$((FAIL_COUNT + 1))
       continue
     fi
-    if [[ -z "$token" ]]; then
-      log "  ERROR: id_token variable '${token_var}' is empty/unset."
-      log "         Declare it under 'id_tokens:' in .gitlab-ci.yml with an aud matching ${provider}."
-      FAIL_COUNT=$((FAIL_COUNT + 1))
-      continue
-    fi
-    log "  WIF: ${service_account} via ${provider_var}"
+    # Fall back to the default region when the entry omits `location`.
+    location="$(trim "$location")"
+    [[ -z "$location" ]] && location="$DEFAULT_LOCATION"
+    log "  WIF: ${service_account} via ${provider_var} | region ${location}"
 
     if ! gcp_login_wif "$project_id" "$provider" "$service_account" "$token"; then
       FAIL_COUNT=$((FAIL_COUNT + 1))
@@ -308,8 +340,7 @@ main() {
     log "  authenticated via WIF"
 
     tmp_csv="$WORKDIR/out_${project_id}.csv"
-    local -a inv_args=("$project_id" --output "$tmp_csv")
-    [[ -n "$location" ]] && inv_args+=(--locations "$location")
+    local -a inv_args=("$project_id" --output "$tmp_csv" --locations "$location")
     [[ -n "$COMPOSER_FILTER" ]] && inv_args+=(--environment "$COMPOSER_FILTER")
 
     if bash "$INVENTORY_SH" "${inv_args[@]}"; then
@@ -332,7 +363,7 @@ main() {
 
   # Guarantee the artifact exists even if every project failed.
   if [[ "$HEADER_WRITTEN" -eq 0 ]]; then
-    printf 'Composer,Project,DAG_Name,Dag_path,Active?,Scheduled,Scheduled Time\n' >"$FINAL_CSV"
+    printf '%s\n' "$CSV_HEADER" >"$FINAL_CSV"
   fi
 
   local rows=0
