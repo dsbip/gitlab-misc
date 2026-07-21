@@ -8,6 +8,8 @@ Miscellaneous scripts and GitLab CI pipelines for operational tasks.
 | --- | --- |
 | [`composer-dag-inventory/`](composer-dag-inventory/) | Inventory all DAGs across every running Cloud Composer environment in a GCP project and export a CSV. Two implementations: Python (Airflow REST API) and Bash (gcloud CLI). |
 | [`.gitlab-ci.yml`](.gitlab-ci.yml) | Pipeline that runs the inventory and publishes the CSV as a downloadable artifact. |
+| [`single-run/`](single-run/) | Loop over multiple GCP projects, authenticate to each with Workload Identity Federation, run the DAG inventory, and append everything into one combined CSV artifact. Optional per-project / per-instance runtime filters. |
+| [`view-authorizations/`](view-authorizations/) | Check BigQuery authorized-view chains across projects: fetch each dataset's authorized views over WIF, then flag views whose authorization chain is missing or broken. Python + shell analyzers; emailable report. |
 
 ---
 

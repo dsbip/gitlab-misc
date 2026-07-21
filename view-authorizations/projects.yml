@@ -1,0 +1,26 @@
+# GCP projects whose BigQuery datasets are scanned for authorized views.
+#
+# WIF connection details are NOT stored here - each entry only NAMES the GitLab
+# CI/CD variables that hold them (values live in Settings > CI/CD > Variables).
+# A single OIDC id_token, named by ID_TOKEN_VAR (default GCP_ID_TOKEN), is shared
+# by every project; every project's WIF provider must accept that token's aud.
+#
+# Fields per entry:
+#   project_id               (required) GCP project id.
+#   wif_provider_url_var     (optional) Name of the CI/CD variable holding the WIF
+#                            provider resource path (no scheme). Default: WIF_PROVIDER_URL.
+#   wif_service_account_var  (optional) Name of the CI/CD variable holding the
+#                            service account to impersonate. Default: WIF_SERVICE_ACCOUNT.
+
+projects:
+  - project_id: composer-project-a
+    wif_provider_url_var: WIF_PROVIDER_URL_A
+    wif_service_account_var: WIF_SERVICE_ACCOUNT_A
+
+  - project_id: composer-project-b
+    wif_provider_url_var: WIF_PROVIDER_URL_B
+    wif_service_account_var: WIF_SERVICE_ACCOUNT_B
+
+  # Projects sharing one provider+SA can omit both *_var fields (they default to
+  # WIF_PROVIDER_URL / WIF_SERVICE_ACCOUNT).
+  # - project_id: composer-project-c

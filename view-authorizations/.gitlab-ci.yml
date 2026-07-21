@@ -1,0 +1,129 @@
+# GitLab CI: BigQuery authorized-view chain report.
+#
+# Scans each project's dataset ACLs for authorized views, then analyzes
+# views.csv to flag views whose authorization chain is missing or broken, and
+# publishes the report as a downloadable artifact.
+#
+# ---------------------------------------------------------------------------
+# CI/CD variables (Settings > CI/CD > Variables)
+# ---------------------------------------------------------------------------
+#   WIF_PROVIDER_URL_A / WIF_SERVICE_ACCOUNT_A   per-project WIF (see projects.yml)
+#   WIF_PROVIDER_URL_B / WIF_SERVICE_ACCOUNT_B
+#   WIF_AUDIENCE                                 aud every provider accepts (below)
+#   NOTIFY_EMAILS   (optional) comma-separated recipients, used by the SMTP job
+#
+# ---------------------------------------------------------------------------
+# Emailing the report artifact - natively from GitLab
+# ---------------------------------------------------------------------------
+# GitLab does not attach artifacts to emails itself, but it DOES email pipeline
+# results natively. The native, no-extra-infrastructure setup is:
+#
+#   1. Project > Settings > Integrations > "Pipeline emails" (a.k.a. Pipelines
+#      email): add the recipient addresses and choose to be notified on success
+#      and/or failure. GitLab then emails every pipeline result to them.
+#   2. This job prints stable "latest artifact" URLs (below) and writes a
+#      SUMMARY.txt into the artifact, so recipients click straight through from
+#      the pipeline email to download view_auth_broken.csv / the full report.
+#   3. For a regular cadence, add a *pipeline schedule* (CI/CD > Schedules);
+#      the schedule owner is emailed on failure by default, and Pipeline emails
+#      covers success too.
+#
+# Stable artifact links (work once the job has run on the default branch):
+#   Full report (zip):   $CI_PROJECT_URL/-/jobs/artifacts/<ref>/download?job=view-authorization-report
+#   Broken list (raw):   $CI_PROJECT_URL/-/jobs/artifacts/<ref>/raw/view-auth-report/view_auth_broken.csv?job=view-authorization-report
+#
+# If you MUST attach the CSV to the email, enable the optional `email-report`
+# job at the bottom (it uses an SMTP relay via swaks - not a native GitLab
+# feature, so it needs SMTP_* variables).
+
+stages:
+  - report
+  - notify
+
+variables:
+  TARGETS_FILE: "view-authorizations/projects.yml"
+  VIEWS_CSV: "view-authorizations/views.csv"
+  OUT_DIR: "view-auth-report"
+  ID_TOKEN_VAR: "GCP_ID_TOKEN"
+  # Set to "true" once the placeholder BigQuery job is wired up with real SQL.
+  RUN_BQ_JOB: "false"
+
+view-authorization-report:
+  stage: report
+  image: google/cloud-sdk:slim
+
+  # One shared OIDC token; every project's WIF provider must accept this aud.
+  id_tokens:
+    GCP_ID_TOKEN:
+      aud: "$WIF_AUDIENCE"
+
+  before_script:
+    # jq: parse bq output. python3-yaml: read projects.yml (shell fallback exists).
+    - apt-get update -qq && apt-get install -y -qq jq python3-yaml >/dev/null
+    - chmod +x view-authorizations/check_view_authorizations.sh
+                view-authorizations/analyze_view_auth.sh
+
+  script:
+    - mkdir -p "$OUT_DIR"
+    - view-authorizations/check_view_authorizations.sh
+        --config "$TARGETS_FILE"
+        --views "$VIEWS_CSV"
+        --out-dir "$OUT_DIR"
+    # Build a short SUMMARY.txt for the pipeline email / artifact preview.
+    - |
+      BROKEN=$(( $(wc -l < "$OUT_DIR/view_auth_broken.csv") - 1 ))
+      {
+        echo "BigQuery authorized-view report - pipeline $CI_PIPELINE_ID"
+        echo "Broken / unverifiable authorizations: $BROKEN"
+        echo
+        echo "Full report artifact:"
+        echo "  $CI_PROJECT_URL/-/jobs/$CI_JOB_ID/artifacts/download"
+        echo "Broken list (raw CSV):"
+        echo "  $CI_PROJECT_URL/-/jobs/$CI_JOB_ID/artifacts/raw/$OUT_DIR/view_auth_broken.csv"
+        echo
+        echo "Broken links:"
+        cat "$OUT_DIR/view_auth_broken.csv"
+      } | tee "$OUT_DIR/SUMMARY.txt"
+
+  artifacts:
+    name: "view-auth-report-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - view-auth-report/
+    expire_in: 30 days
+    when: always
+
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: always
+    - when: manual
+      allow_failure: true
+
+# ---------------------------------------------------------------------------
+# OPTIONAL: attach the report to an email via an SMTP relay (NOT native GitLab).
+# Enable by setting SMTP_SERVER / SMTP_FROM / NOTIFY_EMAILS (+ SMTP_USER /
+# SMTP_PASSWORD if your relay needs auth). Prefer the native Pipeline emails
+# integration above unless you specifically need the file attached.
+# ---------------------------------------------------------------------------
+email-report:
+  stage: notify
+  image: debian:stable-slim
+  needs:
+    - job: view-authorization-report
+      artifacts: true
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq swaks ca-certificates >/dev/null
+  script:
+    - test -n "$SMTP_SERVER" || { echo "SMTP_SERVER not set; skipping."; exit 0; }
+    - |
+      swaks --server "$SMTP_SERVER" \
+        ${SMTP_USER:+--auth-user "$SMTP_USER"} \
+        ${SMTP_PASSWORD:+--auth-password "$SMTP_PASSWORD"} \
+        --from "${SMTP_FROM:-ci@example.com}" \
+        --to "$NOTIFY_EMAILS" \
+        --header "Subject: BigQuery view-authorization report ($CI_COMMIT_SHORT_SHA)" \
+        --body "$OUT_DIR/SUMMARY.txt" \
+        --attach-type text/csv --attach "@$OUT_DIR/view_auth_broken.csv" \
+        --attach-type text/csv --attach "@$OUT_DIR/view_auth_chains.csv"
+  rules:
+    - when: manual
+      allow_failure: true
