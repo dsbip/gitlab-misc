@@ -1,0 +1,5 @@
+project,dataset,view,base_datasets
+composer-project-a,curated,customer_v,composer-project-a.raw
+composer-project-b,marts,customer_enriched_v,composer-project-a.curated
+composer-project-c,reporting,customer_report_v,composer-project-b.marts
+composer-project-b,marts,orders_v,composer-project-a.raw;composer-project-a.curated

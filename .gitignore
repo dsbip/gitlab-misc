@@ -1,6 +1,8 @@
 # Generated inventory output
 composer_dags.csv
 *.csv
+# ...but keep the checked-in input CSV(s) the pipelines read
+!view-authorizations/views.csv
 
 # Credentials — never commit
 *.json.key
