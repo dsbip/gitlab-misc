@@ -400,16 +400,22 @@ reconcile_role() {
     del_by_action["$act"]="${del_by_action[$act]:+${del_by_action[$act]}$'\n'}$res"
   done
 
-  local -a res_arr
+  # Apply ONE (action, resource) per call, role first, resource single-quoted.
+  # Listing several resources after one -r is unreliable via `gcloud composer
+  # environments run`: the airflow -r flag greedily consumes following tokens,
+  # so it swallows the role and splits multi-word resources like "DAG Runs" into
+  # "DAG" and "Runs". A separate, fully-quoted command per resource avoids this.
   for act in "${!add_by_action[@]}"; do
-    res_arr=()
-    while IFS= read -r res; do [[ -n "$res" ]] && res_arr+=("$res"); done <<<"${add_by_action[$act]}"
-    run_mutation "roles add-perms" "$R" -a "$act" -r "${res_arr[@]}"
+    while IFS= read -r res; do
+      [[ -n "$res" ]] || continue
+      run_mutation "roles add-perms" "$R" -a "$act" -r "$res"
+    done <<<"${add_by_action[$act]}"
   done
   for act in "${!del_by_action[@]}"; do
-    res_arr=()
-    while IFS= read -r res; do [[ -n "$res" ]] && res_arr+=("$res"); done <<<"${del_by_action[$act]}"
-    run_mutation "roles del-perms" "$R" -a "$act" -r "${res_arr[@]}"
+    while IFS= read -r res; do
+      [[ -n "$res" ]] || continue
+      run_mutation "roles del-perms" "$R" -a "$act" -r "$res"
+    done <<<"${del_by_action[$act]}"
   done
 
   # Users: grant the role, strip forbidden roles.

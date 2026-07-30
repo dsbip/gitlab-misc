@@ -92,8 +92,11 @@ Everything goes through `gcloud composer environments run <env> --location <loc>
 | add / remove permissions | `roles add-perms <role> -a <action> -r <resource...>` / `del-perms` |
 | grant / revoke a user role | `users add-role -e <email> -r <role>` / `remove-role` |
 
-`add-perms` batches all resources for a given action into one call, so the
-global bundle for an action is added in a single call.
+Each permission is added with its **own** `add-perms` call (one action + one
+resource), because listing several resources after a single `-r` is unreliable
+through `gcloud composer environments run` — the `-r` flag greedily consumes
+following tokens, swallowing the role and splitting multi-word resources like
+`DAG Runs` into `DAG` and `Runs`.
 
 ### Composer caveat
 

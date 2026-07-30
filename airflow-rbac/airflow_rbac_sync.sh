@@ -340,13 +340,20 @@ reconcile_role() {
     act="${key%%|*}"; res="${key#*|}"
     del_by_action["$act"]="${del_by_action[$act]:+${del_by_action[$act]} }$res"
   done
+  # Apply ONE (action, resource) per call, role first, resource single-quoted.
+  # Listing several resources after one -r is unreliable via `gcloud composer
+  # environments run` (the airflow -r flag greedily consumes following tokens,
+  # swallowing the role and splitting multi-word resources); a separate command
+  # per resource avoids this.
   for act in "${!add_by_action[@]}"; do
-    # shellcheck disable=SC2086
-    run_mutation "roles add-perms" "$R" -a "$act" -r ${add_by_action[$act]}
+    for res in ${add_by_action[$act]}; do
+      run_mutation "roles add-perms" "$R" -a "$act" -r "$res"
+    done
   done
   for act in "${!del_by_action[@]}"; do
-    # shellcheck disable=SC2086
-    run_mutation "roles del-perms" "$R" -a "$act" -r ${del_by_action[$act]}
+    for res in ${del_by_action[$act]}; do
+      run_mutation "roles del-perms" "$R" -a "$act" -r "$res"
+    done
   done
 
   # Users: grant the role, strip forbidden roles.
