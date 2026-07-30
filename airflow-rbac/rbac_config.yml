@@ -1,0 +1,27 @@
+# Airflow DAG-level RBAC, managed idempotently by airflow_rbac_sync.sh.
+#
+# Each top-level key is an Airflow CUSTOM ROLE to manage:
+#   roles:              Airflow permission actions (normalized: "can read" -> can_read)
+#   Dags_list:          DAG ids the permissions apply to (resource DAG:<dag_id>)
+#   User_account_list:  user emails that should hold the role
+#
+# The pipeline also removes the "Op" and "Admin" roles from every listed user.
+
+composer_dag_editors:
+  roles:
+    - can read
+    - can edit
+  Dags_list:
+    - example_dag_one
+    - example_dag_two
+  User_account_list:
+    - user1@abc.com
+    - user2@abc.com
+
+composer_dag_viewers:
+  roles:
+    - can read
+  Dags_list:
+    - example_dag_three
+  User_account_list:
+    - user3@abc.com
