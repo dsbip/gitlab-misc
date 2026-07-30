@@ -12,6 +12,7 @@ Miscellaneous scripts and GitLab CI pipelines for operational tasks.
 | [`view-authorizations/`](view-authorizations/) | Check BigQuery authorized-view chains across projects: fetch each dataset's authorized views over WIF, then flag views whose authorization chain is missing or broken. Python + shell analyzers; emailable report. |
 | [`airflow-rbac/`](airflow-rbac/) | Hourly GitLab stage that assigns user emails DAG-level Airflow (Cloud Composer) permissions from a YAML config, idempotently, and strips `Op`/`Admin` from those users. gcloud + Airflow CLI. |
 | [`airflow-rbac-v2/`](airflow-rbac-v2/) | Same as `airflow-rbac/` but grants a fixed per-DAG capability **bundle** (view DAG/code/runs, create & edit DAG runs, view task instances & logs) — a mix of per-DAG and global Airflow permissions. |
+| [`airflow-rbac-rest/`](airflow-rbac-rest/) | Same capability bundle as `airflow-rbac-v2/`, but via the **Airflow REST API** instead of the CLI — required because Composer blocks `roles add-perms` (and other RBAC mutations) through `environments run`. |
 
 ---
 
