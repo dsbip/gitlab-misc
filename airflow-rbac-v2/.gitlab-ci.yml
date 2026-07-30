@@ -1,0 +1,73 @@
+# GitLab CI: sync Airflow (Cloud Composer) DAG-level RBAC from rbac_config.yml.
+#
+# Runs every hour via a pipeline schedule and reconciles Airflow to match the
+# config: for each DAG in a role it grants the capability bundle (view DAG /
+# DAG code / DAG runs, create & edit DAG runs, view task instances & logs),
+# grants the role to the listed users, and strips "Op"/"Admin" from those users.
+# It is idempotent - if Airflow already matches, it makes no changes.
+#
+# ---------------------------------------------------------------------------
+# Run it every hour
+# ---------------------------------------------------------------------------
+# GitLab does not run jobs hourly on its own - add a *pipeline schedule*:
+#   CI/CD > Schedules > New schedule, cron:  0 * * * *
+# The rule below runs this job on scheduled pipelines (and offers a manual
+# "play" button otherwise).
+#
+# ---------------------------------------------------------------------------
+# CI/CD variables (Settings > CI/CD > Variables)
+# ---------------------------------------------------------------------------
+#   COMPOSER_PROJECT       GCP project id of the Composer environment
+#   COMPOSER_LOCATION      Composer region (e.g. europe-west2)
+#   COMPOSER_ENVIRONMENT   Composer environment name
+#   WIF_PROVIDER_URL / WIF_SERVICE_ACCOUNT  (optional) Workload Identity Federation;
+#                          if unset, the job assumes gcloud is already authenticated.
+#   WIF_AUDIENCE           (optional) aud for the id_token, if using WIF.
+
+stages:
+  - rbac
+
+variables:
+  RBAC_CONFIG: "airflow-rbac-v2/rbac_config.yml"
+
+airflow-rbac-sync-v2:
+  stage: rbac
+  image: google/cloud-sdk:slim
+
+  # Optional: a Workload Identity Federation token (only used if WIF_* are set).
+  id_tokens:
+    GCP_ID_TOKEN:
+      aud: "${WIF_AUDIENCE}"
+
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq jq python3-yaml >/dev/null
+    - chmod +x airflow-rbac-v2/airflow_rbac_sync.sh
+    # Authenticate. Prefer WIF when configured; otherwise rely on the runner's
+    # existing gcloud credentials (e.g. a service-account key).
+    - |
+      if [ -n "${WIF_PROVIDER_URL:-}" ] && [ -n "${WIF_SERVICE_ACCOUNT:-}" ]; then
+        printf '%s' "$GCP_ID_TOKEN" > /tmp/oidc_token
+        gcloud iam workload-identity-pools create-cred-config "$WIF_PROVIDER_URL" \
+          --service-account="$WIF_SERVICE_ACCOUNT" \
+          --service-account-token-lifetime-seconds=3600 \
+          --output-file=/tmp/cred.json --credential-source-file=/tmp/oidc_token
+        gcloud auth login --cred-file=/tmp/cred.json --quiet
+      fi
+    - gcloud config set project "$COMPOSER_PROJECT" --quiet
+
+  script:
+    - airflow-rbac-v2/airflow_rbac_sync.sh
+        --config "$RBAC_CONFIG"
+        --project "$COMPOSER_PROJECT"
+        --location "$COMPOSER_LOCATION"
+        --environment "$COMPOSER_ENVIRONMENT"
+
+  after_script:
+    - gcloud auth revoke --all --quiet 2>/dev/null || true
+    - rm -f /tmp/oidc_token /tmp/cred.json 2>/dev/null || true
+
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: always
+    - when: manual
+      allow_failure: true

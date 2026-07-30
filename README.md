@@ -11,6 +11,7 @@ Miscellaneous scripts and GitLab CI pipelines for operational tasks.
 | [`single-run/`](single-run/) | Loop over multiple GCP projects, authenticate to each with Workload Identity Federation, run the DAG inventory, and append everything into one combined CSV artifact. Optional per-project / per-instance runtime filters. |
 | [`view-authorizations/`](view-authorizations/) | Check BigQuery authorized-view chains across projects: fetch each dataset's authorized views over WIF, then flag views whose authorization chain is missing or broken. Python + shell analyzers; emailable report. |
 | [`airflow-rbac/`](airflow-rbac/) | Hourly GitLab stage that assigns user emails DAG-level Airflow (Cloud Composer) permissions from a YAML config, idempotently, and strips `Op`/`Admin` from those users. gcloud + Airflow CLI. |
+| [`airflow-rbac-v2/`](airflow-rbac-v2/) | Same as `airflow-rbac/` but grants a fixed per-DAG capability **bundle** (view DAG/code/runs, create & edit DAG runs, view task instances & logs) — a mix of per-DAG and global Airflow permissions. |
 
 ---
 

@@ -1,0 +1,34 @@
+# Airflow DAG-level RBAC (v2), managed idempotently by airflow_rbac_sync.sh.
+#
+# Each top-level key is an Airflow CUSTOM ROLE. For every DAG in Dags_list the
+# role is granted a fixed capability BUNDLE:
+#   1. view the DAG            4. create DAG runs (trigger)
+#   2. view DAG code           5. view task instances / task runs / logs
+#   3. view DAG runs           6. edit DAG runs (clear / mark)
+# (per-DAG can_read/can_edit on DAG:<dag_id> + the global DAG Runs / DAG Code /
+# Task Instances / Task Logs permissions those capabilities require.)
+#
+# Fields per role:
+#   roles:              OPTIONAL. Extra Airflow actions to add per DAG on top of
+#                       the bundle (e.g. "can delete"). Omit for just the bundle.
+#   Dags_list:          DAG ids the bundle applies to.
+#   User_account_list:  user emails that should hold the role.
+#
+# The pipeline also removes the "Op" and "Admin" roles from every listed user.
+
+composer_dag_operators:
+  Dags_list:
+    - example_dag_one
+    - example_dag_two
+  User_account_list:
+    - user1@abc.com
+    - user2@abc.com
+
+composer_dag_operators_reporting:
+  # roles: is optional - here we add can_delete on top of the bundle.
+  roles:
+    - can delete
+  Dags_list:
+    - example_dag_three
+  User_account_list:
+    - user3@abc.com
