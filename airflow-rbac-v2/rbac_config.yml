@@ -10,7 +10,10 @@
 #
 # Fields per role:
 #   roles:              OPTIONAL. Extra Airflow actions to add per DAG on top of
-#                       the bundle (e.g. "can delete"). Omit for just the bundle.
+#                       the bundle. Omit it (as below) for just the bundle.
+#                       NOTE: the bundle does NOT include can_delete, so users
+#                       CANNOT delete the DAG. Only add "can delete" here if you
+#                       explicitly want to allow deleting the DAG's records.
 #   Dags_list:          DAG ids the bundle applies to.
 #   User_account_list:  user emails that should hold the role.
 #
@@ -25,9 +28,6 @@ composer_dag_operators:
     - user2@abc.com
 
 composer_dag_operators_reporting:
-  # roles: is optional - here we add can_delete on top of the bundle.
-  roles:
-    - can delete
   Dags_list:
     - example_dag_three
   User_account_list:
