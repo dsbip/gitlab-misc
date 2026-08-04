@@ -90,3 +90,16 @@ Every mutating call is guarded by the current Airflow state fetched at the start
 so re-runs are no-ops once in sync. The job prints `already in sync; no changes
 made` when nothing needed doing, and a per-change log otherwise. `--dry-run`
 prints the plan (`[plan] airflow ...`) without touching Airflow.
+
+## Debugging: permissions that disappear after being added
+
+If per-DAG permissions get removed from a role "after some time", drop
+[`inspect_fab_perms.py`](inspect_fab_perms.py) into the environment's `dags/`
+(GCS) folder. It's a **read-only** DAG that snapshots the FAB RBAC tables
+(`ab_view_menu`, `ab_permission_view`, `ab_permission_view_role`, ...) for a set
+of DAGs and prints them to the task log — Composer's metadata DB is private, so
+this is how you query it. Set Airflow Variables `inspect_fab_dags`
+(comma-separated dag_ids) and `inspect_fab_role`, trigger it before and after the
+perms vanish (or schedule it `*/5 * * * *`), and watch whether each DAG's
+`ab_view_menu` **id changes** (the resource is being deleted+recreated, orphaning
+role assignments) or stays constant (the assignment is being deleted directly).
